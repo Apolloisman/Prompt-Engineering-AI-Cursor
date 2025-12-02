@@ -1,12 +1,20 @@
 import { PromptAnalyzer, PromptAnalysis } from './promptAnalyzer';
+import { ChatHistoryContext } from './chatHistoryManager';
 
 export interface MLRecommendations {
     goal: string;
     suggestedModel: ModelRecommendation;
+    cursorAutoModelSufficient: boolean;
+    cursorAutoModelReason: string;
+    frontierModelRecommendation?: FrontierModelRecommendation;
+    gemini3FreeCompatible: GeminiCompatibility;
     temperature: number;
     samplingParams: SamplingParams;
     requiredContext: ContextRequirement[];
+    requiredReferences: ReferenceRequirement[];
+    referenceAssessment: ReferenceAssessment;
     suggestedFormat: FormatRecommendation;
+    suggestedLanguages: LanguageRecommendation[];
     missingElements: string[];
     filledPrompt: string;
     iterationStrategy: IterationStrategy;
@@ -20,6 +28,50 @@ export interface ModelRecommendation {
     alternatives: string[];
     costEstimate: string;
     speedEstimate: string;
+    isFrontier: boolean;
+}
+
+export interface FrontierModelRecommendation {
+    recommended: string;
+    reason: string;
+    alternatives: string[];
+    whenToUse: string;
+}
+
+export interface GeminiCompatibility {
+    compatible: boolean;
+    reason: string;
+    estimatedTokens: number;
+    limitations: string[];
+    recommendations: string[];
+}
+
+export interface ReferenceRequirement {
+    type: 'documentation' | 'api' | 'tutorial' | 'example' | 'specification' | 'standard' | 'library';
+    description: string;
+    priority: 'high' | 'medium' | 'low';
+    examples: string[];
+    whereToFind: string;
+    criticalForDecision: boolean;
+    whyNeeded: string;
+}
+
+export interface ReferenceAssessment {
+    criticalReferencesNeeded: ReferenceRequirement[];
+    referencesImpactDecision: boolean;
+    decisionConfidenceWithoutRefs: number;
+    decisionConfidenceWithRefs: number;
+    processStepsRequiringRefs: string[];
+    recommendation: string;
+}
+
+export interface LanguageRecommendation {
+    language: string;
+    reason: string;
+    complexity: 'simple' | 'medium' | 'complex';
+    suitability: number; // 0-100
+    pros: string[];
+    cons: string[];
 }
 
 export interface SamplingParams {
@@ -61,48 +113,84 @@ export class MLAdvisor {
         this.patternMatcher = new PatternMatcher();
     }
 
-    analyzeAndRecommend(prompt: string, availableModels?: string[]): MLRecommendations {
+    analyzeAndRecommend(prompt: string, availableModels?: string[], chatHistory?: ChatHistoryContext): MLRecommendations {
         // Analyze the prompt
         const analysis = this.analyzer.analyze(prompt);
         
-        // Determine goal
-        const goal = this.determineGoal(prompt, analysis);
+        // Determine goal (considering chat history patterns)
+        const goal = this.determineGoal(prompt, analysis, chatHistory);
+        
+        // Check if Cursor's auto model is sufficient
+        const cursorAutoModelCheck = this.checkCursorAutoModelSufficiency(prompt, goal, analysis);
         
         // Recommend model
         const suggestedModel = this.recommendModel(prompt, goal, availableModels);
+        
+        // Recommend frontier models if needed
+        const frontierModel = cursorAutoModelCheck.sufficient ? undefined : this.recommendFrontierModel(prompt, goal);
+        
+        // Check Gemini 3 free mode compatibility
+        const gemini3Compatibility = this.checkGemini3FreeCompatibility(prompt, goal, analysis);
         
         // Suggest parameters
         const temperature = this.recommendTemperature(prompt, goal);
         const samplingParams = this.recommendSamplingParams(prompt, goal, temperature);
         
-        // Identify required context
-        const requiredContext = this.identifyRequiredContext(prompt, goal, analysis);
+        // Identify required context (considering what was already provided)
+        const requiredContext = this.identifyRequiredContext(prompt, goal, analysis, chatHistory);
+        
+        // Identify required references (filtering out already mentioned ones)
+        const requiredReferences = this.identifyRequiredReferences(prompt, goal, chatHistory);
+        
+        // Assess if references are critical for decision-making
+        const referenceAssessment = this.assessReferenceNeeds(prompt, goal, requiredReferences, analysis, chatHistory);
+        
+        // Adjust model recommendation based on reference needs
+        const adjustedModel = this.adjustModelForReferences(suggestedModel, referenceAssessment);
+        
+        // Recommend programming languages (considering reference availability)
+        const suggestedLanguages = this.recommendLanguages(prompt, goal, referenceAssessment);
         
         // Recommend format
         const suggestedFormat = this.recommendFormat(prompt, goal);
         
-        // Find missing elements
-        const missingElements = this.findMissingElements(prompt, analysis, requiredContext);
+        // Check if prompt needs more detail/breakdown
+        const detailRecommendation = this.assessDetailLevel(prompt, goal, analysis);
         
-        // Fill in missing parts
-        const filledPrompt = this.fillMissingParts(prompt, goal, missingElements, suggestedFormat);
+        // Find missing elements (including reference needs)
+        const missingElements = this.findMissingElements(prompt, analysis, requiredContext, referenceAssessment);
         
-        // Create iteration strategy
-        const iterationStrategy = this.createIterationStrategy(prompt, goal, analysis.score);
+        // Add detail recommendations to missing elements
+        if (detailRecommendation.needsMoreDetail || detailRecommendation.needsBreakdown) {
+            missingElements.push(...detailRecommendation.recommendations);
+        }
+        
+        // Fill in missing parts (including detail/breakdown suggestions)
+        const filledPrompt = this.fillMissingParts(prompt, goal, missingElements, suggestedFormat, referenceAssessment, detailRecommendation);
+        
+        // Create iteration strategy (considering reference needs and detail level)
+        const iterationStrategy = this.createIterationStrategy(prompt, goal, analysis.score, referenceAssessment, detailRecommendation);
         
         // Generate verification checklist
         const verificationChecklist = this.generateVerificationChecklist(prompt, goal, suggestedFormat);
         
-        // Calculate confidence
-        const confidence = this.calculateConfidence(analysis, missingElements.length, requiredContext.length);
+        // Calculate confidence (considering reference availability)
+        const confidence = this.calculateConfidence(analysis, missingElements.length, requiredContext.length, referenceAssessment);
         
         return {
             goal,
             suggestedModel,
+            cursorAutoModelSufficient: cursorAutoModelCheck.sufficient,
+            cursorAutoModelReason: cursorAutoModelCheck.reason,
+            frontierModelRecommendation: frontierModel,
+            gemini3FreeCompatible: gemini3Compatibility,
             temperature,
             samplingParams,
             requiredContext,
+            requiredReferences,
+            referenceAssessment,
             suggestedFormat,
+            suggestedLanguages,
             missingElements,
             filledPrompt,
             iterationStrategy,
@@ -111,7 +199,7 @@ export class MLAdvisor {
         };
     }
 
-    private determineGoal(prompt: string, analysis: PromptAnalysis): string {
+    private determineGoal(prompt: string, analysis: PromptAnalysis, chatHistory?: ChatHistoryContext): string {
         const lower = prompt.toLowerCase();
         
         // Pattern matching for goal detection
@@ -179,13 +267,507 @@ export class MLAdvisor {
             .filter(m => m !== recommended)
             .slice(0, 2);
         
+        // Check if it's a frontier model
+        const frontierModels = ['gpt-4', 'gpt-4-turbo', 'claude-3-opus', 'claude-3-sonnet'];
+        const isFrontier = frontierModels.includes(recommended);
+        
         return {
             model: recommended,
             reason: this.getModelReason(goal, recommended),
             alternatives,
             costEstimate: modelInfo.costEstimate,
-            speedEstimate: modelInfo.speedEstimate
+            speedEstimate: modelInfo.speedEstimate,
+            isFrontier
         };
+    }
+
+    private checkCursorAutoModelSufficiency(prompt: string, goal: string, analysis: PromptAnalysis): { sufficient: boolean; reason: string } {
+        const complexity = this.assessComplexity(prompt, goal, analysis);
+        
+        // Simple tasks that Cursor's auto model handles well
+        const simpleTasks = [
+            'code_generation', // Simple code generation
+            'transformation', // Code transformation
+            'information_extraction' // Simple extraction
+        ];
+        
+        // Tasks that need frontier models
+        const complexTasks = [
+            'debugging', // Complex debugging often needs better reasoning
+            'code_review', // Deep analysis
+            'performance_review', // Requires advanced understanding
+            'security_review' // Critical analysis
+        ];
+        
+        if (complexity === 'low' && simpleTasks.includes(goal)) {
+            return {
+                sufficient: true,
+                reason: 'Cursor\'s auto model selection is sufficient for this simple task. The auto model will choose an appropriate model based on complexity.'
+            };
+        }
+        
+        if (complexity === 'high' || complexTasks.includes(goal) || analysis.score < 50) {
+            return {
+                sufficient: false,
+                reason: 'This task requires advanced reasoning or has high complexity. Consider using a frontier model for better results.'
+            };
+        }
+        
+        return {
+            sufficient: true,
+            reason: 'Cursor\'s auto model should work, but a frontier model may provide better quality for this task.'
+        };
+    }
+
+    private recommendFrontierModel(prompt: string, goal: string): FrontierModelRecommendation {
+        const frontierModels: Record<string, FrontierModelRecommendation> = {
+            'code_generation': {
+                recommended: 'GPT-4 Turbo',
+                reason: 'Excellent code generation with good speed and cost balance',
+                alternatives: ['Claude 3 Sonnet', 'GPT-4'],
+                whenToUse: 'For complex code generation, refactoring, or when you need production-ready code'
+            },
+            'debugging': {
+                recommended: 'GPT-4',
+                reason: 'Superior reasoning capabilities for complex debugging scenarios',
+                alternatives: ['Claude 3 Opus', 'GPT-4 Turbo'],
+                whenToUse: 'For difficult bugs, complex error analysis, or when standard debugging fails'
+            },
+            'code_review': {
+                recommended: 'Claude 3 Sonnet',
+                reason: 'Balanced analysis with excellent code understanding and safety',
+                alternatives: ['GPT-4', 'Claude 3 Opus'],
+                whenToUse: 'For thorough code reviews, security analysis, or architectural feedback'
+            },
+            'performance_review': {
+                recommended: 'GPT-4',
+                reason: 'Strong analytical capabilities for performance optimization',
+                alternatives: ['Claude 3 Sonnet', 'GPT-4 Turbo'],
+                whenToUse: 'For performance analysis, optimization suggestions, or bottleneck identification'
+            },
+            'security_review': {
+                recommended: 'Claude 3 Opus',
+                reason: 'Excellent safety focus and nuanced security analysis',
+                alternatives: ['GPT-4', 'Claude 3 Sonnet'],
+                whenToUse: 'For security audits, vulnerability assessment, or security-critical code'
+            }
+        };
+        
+        return frontierModels[goal] || {
+            recommended: 'GPT-4 Turbo',
+            reason: 'Good general-purpose frontier model',
+            alternatives: ['Claude 3 Sonnet', 'GPT-4'],
+            whenToUse: 'For tasks requiring advanced reasoning or high-quality output'
+        };
+    }
+
+    private checkGemini3FreeCompatibility(prompt: string, goal: string, analysis: PromptAnalysis): GeminiCompatibility {
+        const estimatedTokens = this.estimateTokenCount(prompt);
+        const maxTokens = 100000; // Gemini 3 free mode limit
+        
+        // Check if task is suitable for Gemini
+        const geminiCompatibleGoals = [
+            'code_generation',
+            'explanation',
+            'transformation',
+            'information_extraction',
+            'content_generation'
+        ];
+        
+        const incompatibleGoals = [
+            'security_review', // May have safety restrictions
+            'performance_review' // May need more advanced reasoning
+        ];
+        
+        const compatible = 
+            estimatedTokens < maxTokens * 0.8 && // Use 80% of limit for safety
+            geminiCompatibleGoals.includes(goal) &&
+            !incompatibleGoals.includes(goal) &&
+            analysis.score >= 50; // Need decent prompt quality
+        
+        const limitations: string[] = [];
+        const recommendations: string[] = [];
+        
+        if (estimatedTokens > maxTokens * 0.8) {
+            limitations.push(`Estimated tokens (${estimatedTokens.toLocaleString()}) may exceed free tier limit`);
+            recommendations.push('Consider reducing context or splitting the task');
+        }
+        
+        if (!geminiCompatibleGoals.includes(goal)) {
+            limitations.push(`Task type (${goal}) may not be optimal for Gemini`);
+            recommendations.push('Consider using GPT-4 or Claude for this task type');
+        }
+        
+        if (compatible) {
+            recommendations.push('Gemini 3 free mode is suitable for this task');
+            recommendations.push('Great cost-effective option (free up to 100k tokens)');
+        }
+        
+        return {
+            compatible,
+            reason: compatible 
+                ? `Task is compatible with Gemini 3 free mode. Estimated ${estimatedTokens.toLocaleString()} tokens (well under 100k limit).`
+                : `Task may not be optimal for Gemini 3 free mode. ${limitations.join('; ')}`,
+            estimatedTokens,
+            limitations: limitations.length > 0 ? limitations : ['None'],
+            recommendations
+        };
+    }
+
+    private identifyRequiredReferences(prompt: string, goal: string, chatHistory?: ChatHistoryContext): ReferenceRequirement[] {
+        const requirements: ReferenceRequirement[] = [];
+        const lower = prompt.toLowerCase();
+        
+        // API documentation - CRITICAL for decision-making
+        if (goal === 'code_generation' && this.patternMatcher.matches(lower, ['api', 'library', 'framework', 'sdk'])) {
+            requirements.push({
+                type: 'api',
+                description: 'API documentation for the libraries/frameworks you\'re using',
+                priority: 'high',
+                examples: ['Official API docs', 'Library documentation', 'SDK reference'],
+                whereToFind: 'Check official documentation sites (e.g., docs.python.org, developer.mozilla.org)',
+                criticalForDecision: true,
+                whyNeeded: 'Without API docs, the AI cannot know correct function signatures, parameters, or return types. This leads to incorrect code generation.'
+            });
+        }
+        
+        // Language documentation - HELPFUL but not always critical
+        if (goal.includes('code')) {
+            requirements.push({
+                type: 'documentation',
+                description: 'Language-specific documentation and style guides',
+                priority: 'medium',
+                examples: ['Python PEP 8', 'JavaScript MDN', 'TypeScript Handbook'],
+                whereToFind: 'Official language documentation and style guides',
+                criticalForDecision: false,
+                whyNeeded: 'Helps ensure code follows best practices and language conventions, improving quality and maintainability.'
+            });
+        }
+        
+        // Tutorials/examples - HELPFUL for learning
+        if (this.patternMatcher.matches(lower, ['learn', 'how', 'tutorial'])) {
+            requirements.push({
+                type: 'tutorial',
+                description: 'Tutorials or examples showing similar implementations',
+                priority: 'low',
+                examples: ['Stack Overflow examples', 'GitHub code samples', 'Official tutorials'],
+                whereToFind: 'Search GitHub, Stack Overflow, or official tutorial sites',
+                criticalForDecision: false,
+                whyNeeded: 'Provides examples of similar implementations to guide the solution approach.'
+            });
+        }
+        
+        // Specifications - CRITICAL for reviews
+        if (goal === 'code_review' || goal === 'security_review') {
+            requirements.push({
+                type: 'specification',
+                description: 'Relevant specifications or standards',
+                priority: 'high',
+                examples: ['Security best practices', 'Performance benchmarks', 'Code standards'],
+                whereToFind: 'Industry standards, OWASP guidelines, language-specific best practices',
+                criticalForDecision: true,
+                whyNeeded: 'Reviews require standards and best practices to evaluate code quality, security, and performance properly.'
+            });
+        }
+        
+        // Library documentation - CRITICAL if library is mentioned
+        if (this.patternMatcher.matches(lower, ['react', 'django', 'express', 'flask', 'library'])) {
+            const libRef: ReferenceRequirement = {
+                type: 'library',
+                description: 'Documentation for specific libraries/frameworks mentioned',
+                priority: 'high',
+                examples: ['React docs', 'Django documentation', 'Express.js guide'],
+                whereToFind: 'Official library documentation websites',
+                criticalForDecision: true,
+                whyNeeded: 'Library-specific APIs, patterns, and conventions are essential for correct implementation.'
+            };
+            
+            // Check if already mentioned in chat history
+            if (!chatHistory || this.shouldSuggestReference(libRef.description, chatHistory)) {
+                requirements.push(libRef);
+            }
+        }
+        
+        // Filter out references already mentioned in chat history
+        if (chatHistory && chatHistory.alreadyMentionedReferences.length > 0) {
+            return requirements.filter(req => {
+                return !chatHistory.alreadyMentionedReferences.some(mentioned => 
+                    req.description.toLowerCase().includes(mentioned.toLowerCase()) ||
+                    mentioned.toLowerCase().includes(req.type.toLowerCase())
+                );
+            });
+        }
+        
+        return requirements;
+    }
+
+    private shouldSuggestReference(refDescription: string, chatHistory: ChatHistoryContext): boolean {
+        return !chatHistory.alreadyMentionedReferences.some(mentioned => 
+            refDescription.toLowerCase().includes(mentioned.toLowerCase()) ||
+            mentioned.toLowerCase().includes(refDescription.toLowerCase())
+        );
+    }
+
+    private assessReferenceNeeds(prompt: string, goal: string, references: ReferenceRequirement[], analysis: PromptAnalysis, chatHistory?: ChatHistoryContext): ReferenceAssessment {
+        const criticalRefs = references.filter(r => r.criticalForDecision);
+        const processSteps: string[] = [];
+        
+        // Determine which decision steps need references
+        if (goal === 'code_generation') {
+            if (criticalRefs.some(r => r.type === 'api' || r.type === 'library')) {
+                processSteps.push('Determining correct API usage and function signatures');
+                processSteps.push('Selecting appropriate library methods');
+                processSteps.push('Ensuring compatibility with library versions');
+            }
+        }
+        
+        if (goal === 'code_review' || goal === 'security_review') {
+            if (criticalRefs.some(r => r.type === 'specification')) {
+                processSteps.push('Evaluating against security standards');
+                processSteps.push('Checking compliance with best practices');
+                processSteps.push('Assessing performance against benchmarks');
+            }
+        }
+        
+        // Calculate confidence impact
+        let confidenceWithoutRefs = analysis.score;
+        let confidenceWithRefs = analysis.score;
+        
+        if (criticalRefs.length > 0) {
+            // Each critical reference missing reduces confidence
+            confidenceWithoutRefs = Math.max(0, analysis.score - (criticalRefs.length * 15));
+            confidenceWithRefs = Math.min(100, analysis.score + (criticalRefs.length * 10));
+        }
+        
+        const referencesImpactDecision = criticalRefs.length > 0 || processSteps.length > 0;
+        
+        let recommendation = '';
+        if (criticalRefs.length > 0) {
+            const alreadyMentioned = chatHistory?.alreadyMentionedReferences.length || 0;
+            if (alreadyMentioned > 0) {
+                recommendation = `⚠️ CRITICAL: ${criticalRefs.length} critical reference(s) still needed. ${alreadyMentioned} reference(s) already mentioned in chat history, but additional ones are required for proper decision-making.`;
+            } else {
+                recommendation = `⚠️ CRITICAL: ${criticalRefs.length} critical reference(s) needed for proper decision-making. Without these, the AI may generate incorrect or suboptimal solutions.`;
+            }
+        } else if (references.length > 0) {
+            if (chatHistory && chatHistory.alreadyMentionedReferences.length > 0) {
+                recommendation = `Some references already mentioned in chat history. Additional references will improve code quality and accuracy.`;
+            } else {
+                recommendation = `References are helpful but not critical. Having them will improve code quality and accuracy.`;
+            }
+        } else {
+            if (chatHistory && chatHistory.alreadyMentionedReferences.length > 0) {
+                recommendation = `Good! Required references have been mentioned in previous messages. The prompt contains sufficient information for decision-making.`;
+            } else {
+                recommendation = `No specific references required. The prompt contains sufficient information for decision-making.`;
+            }
+        }
+        
+        // Add chat history context if available
+        if (chatHistory && chatHistory.patterns.length > 0) {
+            recommendation += `\n\n📊 Chat patterns detected: ${chatHistory.patterns.join(', ')}`;
+        }
+        
+        return {
+            criticalReferencesNeeded: criticalRefs,
+            referencesImpactDecision: referencesImpactDecision,
+            decisionConfidenceWithoutRefs: confidenceWithoutRefs,
+            decisionConfidenceWithRefs: confidenceWithRefs,
+            processStepsRequiringRefs: processSteps,
+            recommendation
+        };
+    }
+
+    private adjustModelForReferences(model: ModelRecommendation, assessment: ReferenceAssessment): ModelRecommendation {
+        // If references are critical, prefer models with better web access or knowledge
+        if (assessment.criticalReferencesNeeded.length > 0) {
+            // Models with better knowledge/context handling
+            const betterKnowledgeModels = ['gpt-4', 'claude-3-opus', 'claude-3-sonnet'];
+            
+            if (!betterKnowledgeModels.includes(model.model)) {
+                return {
+                    ...model,
+                    reason: model.reason + ' Note: With critical references needed, consider a model with better knowledge access.',
+                    alternatives: [...betterKnowledgeModels.filter(m => m !== model.model).slice(0, 2), ...model.alternatives]
+                };
+            }
+        }
+        
+        return model;
+    }
+
+    private recommendLanguages(prompt: string, goal: string, referenceAssessment?: ReferenceAssessment): LanguageRecommendation[] {
+        const lower = prompt.toLowerCase();
+        const recommendations: LanguageRecommendation[] = [];
+        
+        // Detect mentioned languages
+        const mentionedLanguages = this.detectMentionedLanguages(lower);
+        
+        // Language suitability for different goals
+        const languageSuitability: Record<string, Record<string, { suitability: number; pros: string[]; cons: string[] }>> = {
+            'code_generation': {
+                'python': { suitability: 95, pros: ['Simple syntax', 'Great AI support', 'Rich libraries'], cons: ['Slower than compiled'] },
+                'javascript': { suitability: 90, pros: ['Versatile', 'Great for web', 'Large ecosystem'], cons: ['Type safety issues'] },
+                'typescript': { suitability: 95, pros: ['Type safety', 'Great tooling', 'Modern'], cons: ['Requires compilation'] },
+                'rust': { suitability: 70, pros: ['Fast', 'Memory safe'], cons: ['Steep learning curve', 'Complex'] },
+                'go': { suitability: 80, pros: ['Simple', 'Fast', 'Concurrent'], cons: ['Less expressive'] },
+                'java': { suitability: 75, pros: ['Enterprise-ready', 'Strong typing'], cons: ['Verbose', 'Complex'] }
+            },
+            'debugging': {
+                'python': { suitability: 90, pros: ['Clear error messages', 'Easy to debug'], cons: [] },
+                'javascript': { suitability: 85, pros: ['Good debugging tools'], cons: ['Type errors'] },
+                'typescript': { suitability: 90, pros: ['Type checking helps', 'Good tooling'], cons: [] }
+            }
+        };
+        
+        // If languages mentioned, prioritize those
+        if (mentionedLanguages.length > 0) {
+            mentionedLanguages.forEach(lang => {
+                const suitability = languageSuitability[goal]?.[lang] || { suitability: 70, pros: [], cons: [] };
+                recommendations.push({
+                    language: lang.charAt(0).toUpperCase() + lang.slice(1),
+                    reason: `Mentioned in prompt - ${this.getLanguageReason(lang, goal)}`,
+                    complexity: this.getLanguageComplexity(lang),
+                    suitability: suitability.suitability,
+                    pros: suitability.pros,
+                    cons: suitability.cons
+                });
+            });
+        }
+        
+        // Add general recommendations if none mentioned
+        if (recommendations.length === 0) {
+            const generalRecs = this.getGeneralLanguageRecommendations(goal);
+            recommendations.push(...generalRecs);
+        }
+        
+        // Adjust suitability based on reference availability
+        if (referenceAssessment && referenceAssessment.criticalReferencesNeeded.length > 0) {
+            // Languages with better documentation availability get a boost
+            recommendations.forEach(rec => {
+                if (['Python', 'JavaScript', 'TypeScript'].includes(rec.language)) {
+                    rec.suitability = Math.min(100, rec.suitability + 5);
+                    rec.reason += ' (Excellent documentation available)';
+                }
+            });
+        }
+        
+        // Sort by suitability
+        return recommendations.sort((a, b) => b.suitability - a.suitability);
+    }
+
+    private detectMentionedLanguages(text: string): string[] {
+        const languages: string[] = [];
+        const langPatterns: Record<string, string[]> = {
+            'python': ['python', 'py', 'django', 'flask', 'pandas', 'numpy'],
+            'javascript': ['javascript', 'js', 'node', 'react', 'vue', 'angular'],
+            'typescript': ['typescript', 'ts', 'tsx'],
+            'rust': ['rust', 'cargo'],
+            'go': ['go', 'golang'],
+            'java': ['java', 'spring', 'maven'],
+            'csharp': ['c#', 'csharp', '.net', 'asp.net'],
+            'cpp': ['c++', 'cpp', 'cplusplus'],
+            'c': [' c ', ' c,', ' c.', ' c\n']
+        };
+        
+        for (const [lang, patterns] of Object.entries(langPatterns)) {
+            if (patterns.some(p => text.includes(p.toLowerCase()))) {
+                languages.push(lang);
+            }
+        }
+        
+        return languages;
+    }
+
+    private getGeneralLanguageRecommendations(goal: string): LanguageRecommendation[] {
+        const recs: LanguageRecommendation[] = [];
+        
+        if (goal === 'code_generation' || goal === 'debugging') {
+            recs.push({
+                language: 'Python',
+                reason: 'Excellent for AI-assisted development, simple syntax, great libraries',
+                complexity: 'simple',
+                suitability: 95,
+                pros: ['Simple syntax', 'Great AI support', 'Rich ecosystem', 'Easy to learn'],
+                cons: ['Slower execution']
+            });
+            
+            recs.push({
+                language: 'TypeScript',
+                reason: 'Type safety helps AI generate better code, modern tooling',
+                complexity: 'medium',
+                suitability: 90,
+                pros: ['Type safety', 'Great tooling', 'Modern features'],
+                cons: ['Requires compilation', 'More verbose than JavaScript']
+            });
+            
+            recs.push({
+                language: 'JavaScript',
+                reason: 'Versatile, great for web development, large ecosystem',
+                complexity: 'simple',
+                suitability: 85,
+                pros: ['Versatile', 'No compilation', 'Huge ecosystem'],
+                cons: ['No type safety', 'Can be error-prone']
+            });
+        }
+        
+        return recs;
+    }
+
+    private getLanguageReason(lang: string, goal: string): string {
+        const reasons: Record<string, Record<string, string>> = {
+            'python': {
+                'code_generation': 'Simple syntax makes it easy for AI to generate correct code',
+                'debugging': 'Clear error messages and simple structure aid debugging'
+            },
+            'typescript': {
+                'code_generation': 'Type safety helps AI generate more accurate code',
+                'debugging': 'Type checking catches errors early'
+            }
+        };
+        
+        return reasons[lang]?.[goal] || 'Good choice for this task';
+    }
+
+    private getLanguageComplexity(lang: string): 'simple' | 'medium' | 'complex' {
+        const simple = ['python', 'javascript', 'go'];
+        const medium = ['typescript', 'java', 'csharp'];
+        const complex = ['rust', 'cpp', 'c'];
+        
+        if (simple.includes(lang)) return 'simple';
+        if (medium.includes(lang)) return 'medium';
+        if (complex.includes(lang)) return 'complex';
+        return 'medium';
+    }
+
+    private assessComplexity(prompt: string, goal: string, analysis: PromptAnalysis): 'low' | 'medium' | 'high' {
+        let score = 0;
+        
+        // Length indicates complexity
+        if (prompt.length > 500) score += 1;
+        if (prompt.length > 1000) score += 1;
+        
+        // Low analysis score indicates complexity
+        if (analysis.score < 50) score += 2;
+        if (analysis.score < 30) score += 1;
+        
+        // Goal complexity
+        const complexGoals = ['debugging', 'code_review', 'performance_review', 'security_review'];
+        if (complexGoals.includes(goal)) score += 2;
+        
+        // Multiple requirements
+        if (analysis.principleChecks.filter(c => c.status === 'fail').length > 3) score += 1;
+        
+        if (score >= 4) return 'high';
+        if (score >= 2) return 'medium';
+        return 'low';
+    }
+
+    private estimateTokenCount(prompt: string): number {
+        // Rough estimation: ~4 characters per token for English
+        // More accurate: count words and multiply by 1.3
+        const words = prompt.split(/\s+/).length;
+        return Math.ceil(words * 1.3);
     }
 
     private recommendTemperature(prompt: string, goal: string): number {
@@ -238,7 +820,7 @@ export class MLAdvisor {
         return params;
     }
 
-    private identifyRequiredContext(prompt: string, goal: string, analysis: PromptAnalysis): ContextRequirement[] {
+    private identifyRequiredContext(prompt: string, goal: string, analysis: PromptAnalysis, chatHistory?: ChatHistoryContext): ContextRequirement[] {
         const requirements: ContextRequirement[] = [];
         const lower = prompt.toLowerCase();
         
@@ -266,14 +848,23 @@ export class MLAdvisor {
             }
         }
         
-        // Environment context
+        // Environment context (skip if already provided)
         if (goal === 'code_generation' || goal === 'debugging') {
-            requirements.push({
+            const envReq: ContextRequirement = {
                 type: 'environment',
                 description: 'Specify language version, framework, and dependencies',
                 priority: 'medium',
                 example: 'Python 3.10, Django 4.2, PostgreSQL 14'
-            });
+            };
+            
+            // Check if environment was already mentioned
+            if (!chatHistory || !chatHistory.alreadyProvidedContext.some(ctx => 
+                ctx.toLowerCase().includes('environment') || 
+                ctx.toLowerCase().includes('version') ||
+                ctx.toLowerCase().includes('framework')
+            )) {
+                requirements.push(envReq);
+            }
         }
         
         // Constraints
@@ -360,7 +951,7 @@ export class MLAdvisor {
         return formatMap[goal] || formatMap['general_assistance'];
     }
 
-    private findMissingElements(prompt: string, analysis: PromptAnalysis, context: ContextRequirement[]): string[] {
+    private findMissingElements(prompt: string, analysis: PromptAnalysis, context: ContextRequirement[], referenceAssessment?: ReferenceAssessment): string[] {
         const missing: string[] = [];
         
         // Check principles
@@ -375,6 +966,13 @@ export class MLAdvisor {
             missing.push(`${req.type}: ${req.description}`);
         });
         
+        // Check for critical references
+        if (referenceAssessment && referenceAssessment.criticalReferencesNeeded.length > 0) {
+            referenceAssessment.criticalReferencesNeeded.forEach(ref => {
+                missing.push(`CRITICAL REFERENCE: ${ref.type} - ${ref.description}`);
+            });
+        }
+        
         // Check for vague language
         if (analysis.score < 40) {
             missing.push('Specific details and examples');
@@ -383,7 +981,37 @@ export class MLAdvisor {
         return missing;
     }
 
-    private fillMissingParts(prompt: string, goal: string, missing: string[], format: FormatRecommendation): string {
+    private assessDetailLevel(prompt: string, goal: string, analysis: PromptAnalysis): { needsMoreDetail: boolean; needsBreakdown: boolean; recommendations: string[] } {
+        const wordCount = prompt.split(/\s+/).length;
+        const hasSteps = /(step|first|then|next|finally|\d+\.)/i.test(prompt);
+        const hasDetails = wordCount > 100 || 
+                          /(specific|exact|precise|detailed|concrete|particular|example)/i.test(prompt) ||
+                          /\d+/.test(prompt) ||
+                          /['"]([^'"]{10,})['"]/.test(prompt);
+        
+        const needsMoreDetail = wordCount < 50 || (!hasDetails && analysis.score < 70);
+        const needsBreakdown = !hasSteps && (wordCount > 30 || analysis.score < 60);
+        
+        const recommendations: string[] = [];
+        
+        if (needsMoreDetail) {
+            recommendations.push('Add more specific details about what you want');
+            recommendations.push('Include examples or specific requirements');
+            recommendations.push('Specify: What exactly? Where? How? Why?');
+            recommendations.push('Add concrete examples of desired output');
+        }
+        
+        if (needsBreakdown) {
+            recommendations.push('Break the task into numbered steps (1, 2, 3...)');
+            recommendations.push('Break down complex parts into sub-steps');
+            recommendations.push('Use action verbs for each step: "add", "remove", "extract"');
+            recommendations.push('Make each step independently actionable');
+        }
+        
+        return { needsMoreDetail, needsBreakdown, recommendations };
+    }
+
+    private fillMissingParts(prompt: string, goal: string, missing: string[], format: FormatRecommendation, referenceAssessment?: ReferenceAssessment, detailRecommendation?: any): string {
         let filled = prompt;
         
         // If prompt is too vague, add structure
@@ -400,6 +1028,38 @@ export class MLAdvisor {
             filled += '\n\n[Error message to be provided]';
         }
         
+        // Add reference placeholders if critical references needed
+        if (referenceAssessment && referenceAssessment.criticalReferencesNeeded.length > 0) {
+            filled += '\n\n[CRITICAL REFERENCES NEEDED]:';
+            referenceAssessment.criticalReferencesNeeded.forEach(ref => {
+                filled += `\n- ${ref.type}: ${ref.description} (${ref.whereToFind})`;
+            });
+            filled += '\n\nPlease reference these when generating the solution to ensure accuracy.';
+        }
+        
+        // Add detail/breakdown recommendations if needed
+        if (detailRecommendation && (detailRecommendation.needsMoreDetail || detailRecommendation.needsBreakdown)) {
+            filled += '\n\n[RECOMMENDED: Add More Detail and Break Down]:';
+            if (detailRecommendation.needsBreakdown) {
+                filled += '\n\nBreak this task into detailed steps:';
+                filled += '\n1. [Step 1 - What exactly needs to happen?]';
+                filled += '\n2. [Step 2 - What exactly needs to happen?]';
+                filled += '\n3. [Step 3 - What exactly needs to happen?]';
+                filled += '\n\nFor each step, specify:';
+                filled += '\n- What: The specific action or change';
+                filled += '\n- Where: The location or component';
+                filled += '\n- How: The method or approach';
+                filled += '\n- Why: The reason or benefit';
+            }
+            if (detailRecommendation.needsMoreDetail) {
+                filled += '\n\nAdd more specific details:';
+                filled += '\n- Include exact names, numbers, or values';
+                filled += '\n- Provide concrete examples';
+                filled += '\n- Specify constraints or requirements';
+                filled += '\n- Describe expected outcomes';
+            }
+        }
+        
         // Add format specification if missing
         if (!prompt.toLowerCase().includes('format') && !prompt.toLowerCase().includes('output')) {
             filled += `\n\n[Format]: ${format.structure}`;
@@ -414,26 +1074,51 @@ export class MLAdvisor {
         return filled.trim();
     }
 
-    private createIterationStrategy(prompt: string, goal: string, score: number): IterationStrategy {
+    private createIterationStrategy(prompt: string, goal: string, score: number, referenceAssessment?: ReferenceAssessment, detailRecommendation?: any): IterationStrategy {
         const steps: string[] = [];
         let expectedIterations = 1;
         
-        if (score < 60) {
-            steps.push('1. Start with initial prompt');
-            steps.push('2. Review AI response for gaps');
-            steps.push('3. Refine prompt with specific details');
-            steps.push('4. Request improvements on weak areas');
-            expectedIterations = 2;
-        } else if (score < 80) {
-            steps.push('1. Use initial prompt');
-            steps.push('2. Request clarification if needed');
-            expectedIterations = 1;
+        // If critical references are needed, add steps to gather them
+        if (referenceAssessment && referenceAssessment.criticalReferencesNeeded.length > 0) {
+            steps.push('1. Gather required references (CRITICAL for accuracy)');
+            steps.push('2. Review references to understand requirements');
+            steps.push('3. Start with initial prompt + references');
+            expectedIterations += 1;
         } else {
-            steps.push('1. Use prompt as-is');
-            expectedIterations = 1;
+            if (score < 60) {
+                steps.push('1. Start with initial prompt');
+                steps.push('2. Review AI response for gaps');
+                steps.push('3. Refine prompt with specific details');
+                steps.push('4. Request improvements on weak areas');
+                expectedIterations = 2;
+            } else if (score < 80) {
+                steps.push('1. Use initial prompt');
+                steps.push('2. Request clarification if needed');
+                expectedIterations = 1;
+            } else {
+                steps.push('1. Use prompt as-is');
+                expectedIterations = 1;
+            }
         }
         
         const refinementPoints: string[] = [];
+        
+        // Add detail/breakdown refinement points
+        if (detailRecommendation) {
+            if (detailRecommendation.needsBreakdown) {
+                refinementPoints.push('Break down complex parts into smaller steps');
+                refinementPoints.push('Add more detail to each step');
+            }
+            if (detailRecommendation.needsMoreDetail) {
+                refinementPoints.push('Add more specific details and examples');
+                refinementPoints.push('Specify exact requirements and constraints');
+            }
+        }
+        
+        if (referenceAssessment && referenceAssessment.criticalReferencesNeeded.length > 0) {
+            refinementPoints.push('Verify solution matches reference specifications');
+            refinementPoints.push('Cross-check API usage with documentation');
+        }
         if (goal === 'code_generation') {
             refinementPoints.push('Add error handling');
             refinementPoints.push('Include edge cases');
@@ -484,15 +1169,21 @@ export class MLAdvisor {
         return checklist;
     }
 
-    private calculateConfidence(analysis: PromptAnalysis, missingCount: number, contextCount: number): number {
+    private calculateConfidence(analysis: PromptAnalysis, missingCount: number, contextCount: number, referenceAssessment?: ReferenceAssessment): number {
         let confidence = analysis.score;
         
-        // Reduce confidence for missing elements
-        confidence -= missingCount * 5;
-        
-        // Reduce confidence if context is needed
-        if (contextCount > 0) {
-            confidence -= contextCount * 3;
+        // Use reference assessment confidence if available
+        if (referenceAssessment) {
+            confidence = referenceAssessment.decisionConfidenceWithoutRefs;
+        } else {
+            // Fallback to old calculation
+            // Reduce confidence for missing elements
+            confidence -= missingCount * 5;
+            
+            // Reduce confidence if context is needed
+            if (contextCount > 0) {
+                confidence -= contextCount * 3;
+            }
         }
         
         // Boost confidence for high scores

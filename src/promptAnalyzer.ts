@@ -131,28 +131,52 @@ export class PromptAnalyzer {
         const hasAbstract = abstractPhrases.some(pattern => pattern.test(text));
         const hasSteps = /(step|first|then|next|finally|\d+\.)/i.test(text);
         const hasSpecificActions = /(add|remove|extract|replace|create|implement|fix)\s+[a-z]+/i.test(text);
+        
+        // Check for detail level
+        const wordCount = text.split(/\s+/).length;
+        const hasDetails = wordCount > 50 || 
+                          /(specific|exact|precise|detailed|concrete|particular)/i.test(text) ||
+                          /\d+/.test(text) || // Has numbers
+                          /['"]([^'"]{5,})['"]/.test(text); // Has quoted strings/details
 
         if (hasAbstract && !hasSteps && !hasSpecificActions) {
             return {
                 status: 'fail',
-                feedback: 'Prompt is abstract/continuous. Break into concrete, discrete steps.',
+                feedback: 'Prompt is abstract/continuous. Break into concrete, discrete steps with more detail.',
                 suggestions: [
-                    'Break the task into numbered steps',
+                    'Break the task into numbered steps (1, 2, 3...)',
                     'Use action verbs: "add", "remove", "extract", "replace"',
-                    'Specify exact changes: "Extract function X", "Add type hints to Y"'
+                    'Specify exact changes: "Extract function X", "Add type hints to Y"',
+                    'Add more detail: What exactly needs to change? How? Why?',
+                    'Include specific examples: Show what the result should look like'
                 ]
             };
         } else if (hasAbstract && (hasSteps || hasSpecificActions)) {
             return {
                 status: 'warning',
-                feedback: 'Some abstract language, but has concrete elements.',
-                suggestions: ['Consider making all steps more specific']
+                feedback: 'Some abstract language, but has concrete elements. Add more detail to each step.',
+                suggestions: [
+                    'Consider making all steps more specific',
+                    'Add details: What, where, how, why for each step',
+                    'Break down complex steps into sub-steps'
+                ]
+            };
+        } else if (!hasDetails && wordCount < 30) {
+            return {
+                status: 'warning',
+                feedback: 'Prompt could use more detail. Break it down further.',
+                suggestions: [
+                    'Add more specific details about what you want',
+                    'Break down the task into smaller, detailed steps',
+                    'Include examples or specific requirements',
+                    'Specify: What exactly? Where? How? Why?'
+                ]
             };
         }
 
         return {
             status: 'pass',
-            feedback: 'Prompt uses concrete, discrete steps.',
+            feedback: 'Prompt uses concrete, discrete steps with adequate detail.',
             suggestions: []
         };
     }
@@ -307,9 +331,15 @@ export class PromptAnalyzer {
     private makeConcrete(text: string): string {
         // Replace abstract phrases with concrete suggestions
         let concrete = text
-            .replace(/improve\s+(the\s+)?code/gi, 'Refactor the code with these steps:\n1. [specific action 1]\n2. [specific action 2]\n3. [specific action 3]')
-            .replace(/make\s+it\s+better/gi, 'Apply these improvements:\n- [specific improvement 1]\n- [specific improvement 2]')
-            .replace(/fix\s+this/gi, 'Fix the following issues:\n1. [issue 1]\n2. [issue 2]');
+            .replace(/improve\s+(the\s+)?code/gi, 'Refactor the code with these detailed steps:\n1. [specific action 1 - what exactly?]\n2. [specific action 2 - what exactly?]\n3. [specific action 3 - what exactly?]\n\nFor each step, specify:\n- What needs to change\n- Where it needs to change\n- How it should change\n- Why this change is needed')
+            .replace(/make\s+it\s+better/gi, 'Apply these specific improvements:\n- [improvement 1 - be specific about what and how]\n- [improvement 2 - be specific about what and how]\n\nInclude details:\n- What exactly needs improvement?\n- How should it be improved?\n- What should the result look like?')
+            .replace(/fix\s+this/gi, 'Fix the following issues with detailed steps:\n1. [issue 1 - describe the problem in detail]\n2. [issue 2 - describe the problem in detail]\n\nFor each issue:\n- What is the problem?\n- Where does it occur?\n- What should the fix do?\n- How should it be implemented?');
+
+        // If prompt is too short, add breakdown instructions
+        const wordCount = concrete.split(/\s+/).length;
+        if (wordCount < 40 && !/(step|1\.|first|then|break|detail)/i.test(concrete)) {
+            concrete += '\n\n[Break this down into detailed steps with specific actions]';
+        }
 
         return concrete;
     }

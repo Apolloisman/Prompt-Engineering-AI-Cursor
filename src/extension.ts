@@ -3,12 +3,14 @@ import { PromptAnalyzer, PromptAnalysis } from './promptAnalyzer';
 import { PromptTemplates } from './promptTemplates';
 import { GuideViewer } from './guideViewer';
 import { MLAdvisor, MLRecommendations } from './mlAdvisor';
+import { ChatHistoryManager } from './chatHistoryManager';
 
 export function activate(context: vscode.ExtensionContext) {
     const analyzer = new PromptAnalyzer();
     const templates = new PromptTemplates();
     const guideViewer = new GuideViewer(context);
     const mlAdvisor = new MLAdvisor();
+    const chatHistory = new ChatHistoryManager(context);
 
     // Command: Suggest improved prompt
     const suggestCommand = vscode.commands.registerCommand(
@@ -111,11 +113,22 @@ export function activate(context: vscode.ExtensionContext) {
             }, async (progress) => {
                 progress.report({ increment: 0 });
                 
-                const recommendations = mlAdvisor.analyzeAndRecommend(prompt);
+                // Get chat history context
+                const historyContext = chatHistory.getContextForAnalysis();
+                
+                // Analyze with history
+                const recommendations = mlAdvisor.analyzeAndRecommend(prompt, undefined, historyContext);
+                
+                // Add message to history with metadata
+                chatHistory.addMessage(prompt, {
+                    goal: recommendations.goal,
+                    referencesMentioned: recommendations.requiredReferences.map(r => r.type),
+                    contextProvided: recommendations.requiredContext.map(c => c.type)
+                });
                 
                 progress.report({ increment: 100 });
                 
-                showMLRecommendationsPanel(recommendations, prompt);
+                showMLRecommendationsPanel(recommendations, prompt, historyContext);
             });
         }
     );
@@ -304,7 +317,7 @@ function generateAnalysisHTML(analysis: PromptAnalysis, improvedPrompt: string):
 </html>`;
 }
 
-function showMLRecommendationsPanel(recommendations: MLRecommendations, originalPrompt: string) {
+function showMLRecommendationsPanel(recommendations: MLRecommendations, originalPrompt: string, chatHistory?: any) {
     const panel = vscode.window.createWebviewPanel(
         'mlRecommendations',
         'ML-Powered Prompt Recommendations',
@@ -312,7 +325,7 @@ function showMLRecommendationsPanel(recommendations: MLRecommendations, original
         { enableScripts: true, retainContextWhenHidden: true }
     );
 
-    const html = generateMLRecommendationsHTML(recommendations, originalPrompt);
+    const html = generateMLRecommendationsHTML(recommendations, originalPrompt, chatHistory);
     panel.webview.html = html;
 
     // Handle messages from webview
@@ -334,7 +347,7 @@ function showMLRecommendationsPanel(recommendations: MLRecommendations, original
     );
 }
 
-function generateMLRecommendationsHTML(rec: MLRecommendations, original: string): string {
+function generateMLRecommendationsHTML(rec: MLRecommendations, original: string, chatHistory?: any): string {
     const confidenceColor = rec.confidence >= 80 ? '#4CAF50' : rec.confidence >= 60 ? '#FF9800' : '#F44336';
     
     return `<!DOCTYPE html>
@@ -490,10 +503,30 @@ function generateMLRecommendationsHTML(rec: MLRecommendations, original: string)
         <div class="confidence">Confidence Score: ${rec.confidence}%</div>
     </div>
 
+    ${chatHistory && chatHistory.recentMessages.length > 0 ? `
+    <div class="section" style="border-left-color: #2196F3;">
+        <h2>💬 Chat History Context</h2>
+        <p><strong>Session:</strong> ${Math.round(chatHistory.sessionDuration / 60000)} minutes</p>
+        <p><strong>Previous messages:</strong> ${chatHistory.recentMessages.length}</p>
+        ${chatHistory.patterns.length > 0 ? `
+        <p><strong>Detected patterns:</strong> ${chatHistory.patterns.join(', ')}</p>
+        ` : ''}
+        ${chatHistory.alreadyMentionedReferences.length > 0 ? `
+        <p><strong>References already mentioned:</strong> ${chatHistory.alreadyMentionedReferences.slice(0, 5).join(', ')}</p>
+        ` : ''}
+        ${chatHistory.alreadyProvidedContext.length > 0 ? `
+        <p><strong>Context already provided:</strong> ${chatHistory.alreadyProvidedContext.slice(0, 5).join(', ')}</p>
+        ` : ''}
+    </div>
+    ` : ''}
+
     <div class="section">
         <h2>🎯 Detected Goal</h2>
         <div class="goal">${rec.goal.replace(/_/g, ' ').replace(/\b\w/g, l => l.toUpperCase())}</div>
         <p>The ML advisor has identified your prompt's primary goal and optimized recommendations accordingly.</p>
+        ${chatHistory && chatHistory.recentMessages.some((m: any) => m.goal === rec.goal) ? `
+        <p style="color: #2196F3;"><em>💡 This goal matches previous messages in your chat history - recommendations are tailored accordingly.</em></p>
+        ` : ''}
     </div>
 
     <div class="section">
@@ -501,6 +534,7 @@ function generateMLRecommendationsHTML(rec: MLRecommendations, original: string)
         <div class="model-info">
             <div class="info-item">
                 <strong>Model:</strong> <code>${rec.suggestedModel.model}</code>
+                ${rec.suggestedModel.isFrontier ? '<span class="badge badge-info">Frontier</span>' : ''}
             </div>
             <div class="info-item">
                 <strong>Cost:</strong> ${rec.suggestedModel.costEstimate}
@@ -515,6 +549,106 @@ function generateMLRecommendationsHTML(rec: MLRecommendations, original: string)
         <p><strong>Reason:</strong> ${rec.suggestedModel.reason}</p>
         <button class="btn" onclick="copySettings()">Copy Model Settings</button>
     </div>
+
+    ${rec.cursorAutoModelSufficient ? `
+    <div class="section" style="border-left-color: #4CAF50;">
+        <h2>✅ Cursor Auto Model</h2>
+        <p><strong>Status:</strong> <span style="color: #4CAF50;">Sufficient ✓</span></p>
+        <p>${rec.cursorAutoModelReason}</p>
+        <p><em>You can use Cursor's auto model selection - it will choose an appropriate model automatically.</em></p>
+    </div>
+    ` : rec.frontierModelRecommendation ? `
+    <div class="section" style="border-left-color: #FF9800;">
+        <h2>🚀 Frontier Model Recommendation</h2>
+        <p><strong>Status:</strong> <span style="color: #FF9800;">Frontier Model Recommended</span></p>
+        <p>${rec.cursorAutoModelReason}</p>
+        <div style="margin-top: 15px; padding: 10px; background: var(--vscode-editor-background); border-radius: 5px;">
+            <p><strong>Recommended:</strong> <code>${rec.frontierModelRecommendation.recommended}</code></p>
+            <p><strong>Reason:</strong> ${rec.frontierModelRecommendation.reason}</p>
+            <p><strong>Alternatives:</strong> ${rec.frontierModelRecommendation.alternatives.join(', ')}</p>
+            <p><strong>When to Use:</strong> ${rec.frontierModelRecommendation.whenToUse}</p>
+        </div>
+    </div>
+    ` : ''}
+
+    <div class="section" style="border-left-color: ${rec.gemini3FreeCompatible.compatible ? '#4CAF50' : '#FF9800'};">
+        <h2>🆓 Google Gemini 3 Free Mode</h2>
+        <p><strong>Compatible:</strong> <span style="color: ${rec.gemini3FreeCompatible.compatible ? '#4CAF50' : '#FF9800'};">${rec.gemini3FreeCompatible.compatible ? 'Yes ✓' : 'Not Recommended'}</span></p>
+        <p>${rec.gemini3FreeCompatible.reason}</p>
+        <p><strong>Estimated Tokens:</strong> ${rec.gemini3FreeCompatible.estimatedTokens.toLocaleString()} / 100,000 limit</p>
+        ${rec.gemini3FreeCompatible.limitations.length > 0 && rec.gemini3FreeCompatible.limitations[0] !== 'None' ? `
+        <div style="margin-top: 10px;">
+            <strong>Limitations:</strong>
+            <ul>
+                ${rec.gemini3FreeCompatible.limitations.map(l => `<li>${l}</li>`).join('')}
+            </ul>
+        </div>
+        ` : ''}
+        <div style="margin-top: 10px;">
+            <strong>Recommendations:</strong>
+            <ul>
+                ${rec.gemini3FreeCompatible.recommendations.map(r => `<li>${r}</li>`).join('')}
+            </ul>
+        </div>
+    </div>
+
+    ${rec.suggestedLanguages.length > 0 ? `
+    <div class="section">
+        <h2>💻 Suggested Programming Languages</h2>
+        ${rec.suggestedLanguages.map(lang => `
+            <div style="margin: 15px 0; padding: 15px; background: var(--vscode-editor-background); border-radius: 5px; border-left: 4px solid var(--vscode-textLink-foreground);">
+                <h3 style="margin-top: 0;">
+                    ${lang.language} 
+                    <span class="badge badge-${lang.complexity === 'simple' ? 'success' : lang.complexity === 'medium' ? 'warning' : 'info'}">${lang.complexity}</span>
+                    <span class="badge badge-info">${lang.suitability}% match</span>
+                </h3>
+                <p><strong>Reason:</strong> ${lang.reason}</p>
+                ${lang.pros.length > 0 ? `
+                <p><strong>Pros:</strong> ${lang.pros.join(', ')}</p>
+                ` : ''}
+                ${lang.cons.length > 0 ? `
+                <p><strong>Cons:</strong> ${lang.cons.join(', ')}</p>
+                ` : ''}
+            </div>
+        `).join('')}
+    </div>
+    ` : ''}
+
+    ${rec.requiredReferences.length > 0 ? `
+    <div class="section" style="border-left-color: ${rec.referenceAssessment.referencesImpactDecision ? '#F44336' : '#FF9800'};">
+        <h2>📚 Required References</h2>
+        ${rec.referenceAssessment.referencesImpactDecision ? `
+        <div style="padding: 15px; background: #F44336; color: white; border-radius: 5px; margin-bottom: 15px;">
+            <strong>⚠️ CRITICAL FOR DECISION-MAKING</strong>
+            <p style="margin: 5px 0;">${rec.referenceAssessment.recommendation}</p>
+            <p style="margin: 5px 0;"><strong>Confidence without refs:</strong> ${rec.referenceAssessment.decisionConfidenceWithoutRefs}%</p>
+            <p style="margin: 5px 0;"><strong>Confidence with refs:</strong> ${rec.referenceAssessment.decisionConfidenceWithRefs}%</p>
+        </div>
+        ` : `
+        <p><strong>Status:</strong> References are helpful but not critical</p>
+        `}
+        <p>The ML advisor recommends having these references available:</p>
+        ${rec.requiredReferences.map(ref => `
+            <div class="context-item priority-${ref.priority}" style="${ref.criticalForDecision ? 'border-left-width: 5px; border-left-color: #F44336;' : ''}">
+                <strong>${ref.type.replace(/_/g, ' ').toUpperCase()}</strong> 
+                <span class="badge badge-${ref.priority === 'high' ? 'warning' : ref.priority === 'medium' ? 'info' : 'success'}">${ref.priority}</span>
+                ${ref.criticalForDecision ? '<span class="badge" style="background: #F44336; color: white;">CRITICAL</span>' : ''}
+                <p>${ref.description}</p>
+                ${ref.criticalForDecision ? `<p style="color: #F44336; font-weight: bold;">⚠️ ${ref.whyNeeded}</p>` : ''}
+                <p><strong>Examples:</strong> ${ref.examples.join(', ')}</p>
+                <small><strong>Where to find:</strong> ${ref.whereToFind}</small>
+            </div>
+        `).join('')}
+        ${rec.referenceAssessment.processStepsRequiringRefs.length > 0 ? `
+        <div style="margin-top: 15px; padding: 10px; background: var(--vscode-editor-background); border-radius: 5px;">
+            <strong>Decision steps requiring references:</strong>
+            <ul>
+                ${rec.referenceAssessment.processStepsRequiringRefs.map(step => `<li>${step}</li>`).join('')}
+            </ul>
+        </div>
+        ` : ''}
+    </div>
+    ` : ''}
 
     <div class="section">
         <h2>🌡️ Recommended Parameters</h2>
@@ -573,9 +707,22 @@ function generateMLRecommendationsHTML(rec: MLRecommendations, original: string)
 
     ${rec.missingElements.length > 0 ? `
     <div class="section">
-        <h2>⚠️ Missing Elements</h2>
-        <p>The ML advisor identified these missing elements:</p>
-        ${rec.missingElements.map(elem => `<span class="missing">${escapeHtml(elem)}</span>`).join('')}
+        <h2>⚠️ Missing Elements & Recommendations</h2>
+        <p>The ML advisor identified these missing elements and recommends:</p>
+        ${rec.missingElements.map(elem => {
+            const isDetailRec = elem.toLowerCase().includes('detail') || elem.toLowerCase().includes('break');
+            const isBreakdownRec = elem.toLowerCase().includes('step') || elem.toLowerCase().includes('break');
+            return `<div class="missing" style="${isDetailRec || isBreakdownRec ? 'background: #2196F3; font-weight: bold;' : ''}">${escapeHtml(elem)}</div>`;
+        }).join('')}
+        <div style="margin-top: 15px; padding: 15px; background: var(--vscode-editor-background); border-radius: 5px; border-left: 4px solid #2196F3;">
+            <h3 style="margin-top: 0; color: #2196F3;">💡 Key Recommendations:</h3>
+            <ul>
+                <li><strong>Break it down:</strong> Divide complex tasks into numbered steps (1, 2, 3...)</li>
+                <li><strong>Add detail:</strong> Specify what exactly, where, how, and why for each step</li>
+                <li><strong>Be specific:</strong> Use exact names, numbers, and concrete examples</li>
+                <li><strong>Make it actionable:</strong> Each step should be independently verifiable</li>
+            </ul>
+        </div>
     </div>
     ` : ''}
 
