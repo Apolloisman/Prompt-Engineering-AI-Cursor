@@ -1,5 +1,35 @@
 import { PromptAnalyzer, PromptAnalysis } from './promptAnalyzer';
 import { ChatHistoryContext } from './chatHistoryManager';
+import { PromptAgent, AgenticPrompt } from './promptAgent';
+
+export interface TaskActionStep {
+    stepNumber: number;
+    action: string;
+    description: string;
+    why: string;
+    goal: string; // Specific goal for this step
+    subGoals?: string[]; // Sub-goals to achieve this step's goal
+    estimatedTime?: string;
+    dependencies?: string[];
+    requiredContext?: string[];
+    successCriteria?: string[]; // How to know this step is complete
+}
+
+export interface TaskActionPlan {
+    goal: string;
+    overallGoal: string; // Clear statement of what we're trying to achieve
+    planningStrategy: string; // The agent's chosen approach/strategy
+    steps: TaskActionStep[];
+    totalEstimatedTime?: string;
+    complexity: 'simple' | 'medium' | 'complex';
+    prerequisites: string[];
+    basedOnHistory: boolean;
+    historyPattern?: string;
+    goalHierarchy: { // How goals relate to each other
+        overall: string;
+        phaseGoals: { phase: string; goal: string; steps: number[] }[];
+    };
+}
 
 export interface MLRecommendations {
     goal: string;
@@ -17,7 +47,9 @@ export interface MLRecommendations {
     suggestedLanguages: LanguageRecommendation[];
     missingElements: string[];
     filledPrompt: string;
+    agenticPrompt?: AgenticPrompt;
     iterationStrategy: IterationStrategy;
+    taskActionPlan: TaskActionPlan;
     verificationChecklist: string[];
     confidence: number;
 }
@@ -106,14 +138,16 @@ export class MLAdvisor {
     private analyzer: PromptAnalyzer;
     private modelDatabase: Map<string, ModelInfo>;
     private patternMatcher: PatternMatcher;
+    private promptAgent: PromptAgent;
 
     constructor() {
         this.analyzer = new PromptAnalyzer();
         this.modelDatabase = this.initializeModelDatabase();
         this.patternMatcher = new PatternMatcher();
+        this.promptAgent = new PromptAgent();
     }
 
-    analyzeAndRecommend(prompt: string, availableModels?: string[], chatHistory?: ChatHistoryContext): MLRecommendations {
+    async analyzeAndRecommend(prompt: string, availableModels?: string[], chatHistory?: ChatHistoryContext): Promise<MLRecommendations> {
         // Analyze the prompt
         const analysis = this.analyzer.analyze(prompt);
         
@@ -165,17 +199,55 @@ export class MLAdvisor {
             missingElements.push(...detailRecommendation.recommendations);
         }
         
-        // Fill in missing parts (including detail/breakdown suggestions)
-        const filledPrompt = this.fillMissingParts(prompt, goal, missingElements, suggestedFormat, referenceAssessment, detailRecommendation);
+        // Generate concrete task action plan (using ML/history) - needed for enhanced prompt
+        const taskActionPlan = this.generateTaskActionPlan(prompt, goal, analysis, chatHistory, referenceAssessment);
         
-        // Create iteration strategy (considering reference needs and detail level)
-        const iterationStrategy = this.createIterationStrategy(prompt, goal, analysis.score, referenceAssessment, detailRecommendation);
+        // Calculate confidence first (needed for agentic prompt)
+        const confidence = this.calculateConfidence(analysis, missingElements.length, requiredContext.length, referenceAssessment);
         
-        // Generate verification checklist
+        // Generate verification checklist (needed for agentic prompt)
         const verificationChecklist = this.generateVerificationChecklist(prompt, goal, suggestedFormat);
         
-        // Calculate confidence (considering reference availability)
-        const confidence = this.calculateConfidence(analysis, missingElements.length, requiredContext.length, referenceAssessment);
+        // Generate iteration strategy (needed for agentic prompt)
+        const iterationStrategy = this.createIterationStrategy(prompt, goal, analysis.score, referenceAssessment, detailRecommendation);
+        
+        // Generate full ML recommendations to pass to agentic system
+        const fullMLRecommendations: MLRecommendations = {
+            goal,
+            suggestedModel,
+            cursorAutoModelSufficient: cursorAutoModelCheck.sufficient,
+            cursorAutoModelReason: cursorAutoModelCheck.reason,
+            frontierModelRecommendation: frontierModel,
+            gemini3FreeCompatible: gemini3Compatibility,
+            temperature,
+            samplingParams,
+            requiredContext,
+            requiredReferences,
+            referenceAssessment,
+            suggestedFormat,
+            suggestedLanguages,
+            missingElements,
+            filledPrompt: '', // Will be set below
+            iterationStrategy,
+            taskActionPlan,
+            verificationChecklist,
+            confidence
+        };
+        
+        // Generate agentic prompt with full ML recommendations for structural decisions
+        // Now async to support ML model inference
+        const finalAgenticPrompt = await this.promptAgent.generateAgenticPrompt(
+            prompt,
+            analysis,
+            chatHistory,
+            referenceAssessment,
+            fullMLRecommendations
+        );
+        
+        // Use agentic prompt as the filled prompt (it's more comprehensive and structurally optimized)
+        const filledPrompt = finalAgenticPrompt.optimizedPrompt;
+        
+        // Note: confidence, verificationChecklist, and iterationStrategy are now calculated above
         
         return {
             goal,
@@ -193,7 +265,9 @@ export class MLAdvisor {
             suggestedLanguages,
             missingElements,
             filledPrompt,
+            agenticPrompt: finalAgenticPrompt,
             iterationStrategy,
+            taskActionPlan,
             verificationChecklist,
             confidence
         };
@@ -1011,7 +1085,7 @@ export class MLAdvisor {
         return { needsMoreDetail, needsBreakdown, recommendations };
     }
 
-    private fillMissingParts(prompt: string, goal: string, missing: string[], format: FormatRecommendation, referenceAssessment?: ReferenceAssessment, detailRecommendation?: any): string {
+    private fillMissingParts(prompt: string, goal: string, missing: string[], format: FormatRecommendation, referenceAssessment?: ReferenceAssessment, detailRecommendation?: any, taskActionPlan?: TaskActionPlan, analysis?: PromptAnalysis): string {
         let filled = prompt;
         
         // If prompt is too vague, add structure
@@ -1037,10 +1111,63 @@ export class MLAdvisor {
             filled += '\n\nPlease reference these when generating the solution to ensure accuracy.';
         }
         
-        // Add detail/breakdown recommendations if needed
+        // AGENTIC: Add optimized prompt structure with goals and planning
+        if (taskActionPlan) {
+            filled += '\n\n[AGENT-GENERATED OPTIMIZED PLAN]:';
+            filled += `\n\nOverall Goal: ${taskActionPlan.overallGoal}`;
+            filled += `\nPlanning Strategy: ${taskActionPlan.planningStrategy}`;
+            
+            if (taskActionPlan.goalHierarchy.phaseGoals.length > 0) {
+                filled += '\n\nGoal Hierarchy:';
+                taskActionPlan.goalHierarchy.phaseGoals.forEach(phase => {
+                    filled += `\n- ${phase.phase}: ${phase.goal} (Steps ${phase.steps.join(', ')})`;
+                });
+            }
+        }
+        
+        // Add detail/breakdown recommendations if needed - fill with actual steps from action plan
         if (detailRecommendation && (detailRecommendation.needsMoreDetail || detailRecommendation.needsBreakdown)) {
             filled += '\n\n[RECOMMENDED: Add More Detail and Break Down]:';
-            if (detailRecommendation.needsBreakdown) {
+            if (detailRecommendation.needsBreakdown && taskActionPlan && taskActionPlan.steps.length > 0) {
+                filled += '\n\nBreak this task into detailed steps (agent-generated based on ML analysis and chat history):';
+                taskActionPlan.steps.forEach((step, index) => {
+                    filled += `\n\n${step.stepNumber}. ${step.action}`;
+                    filled += `\n   Goal: ${step.goal}`;
+                    if (step.subGoals && step.subGoals.length > 0) {
+                        filled += `\n   Sub-goals:`;
+                        step.subGoals.forEach(sg => filled += `\n     - ${sg}`);
+                    }
+                    filled += `\n   Description: ${step.description}`;
+                    filled += `\n   Why: ${step.why}`;
+                    if (step.successCriteria && step.successCriteria.length > 0) {
+                        filled += `\n   Success Criteria:`;
+                        step.successCriteria.forEach(sc => filled += `\n     ✓ ${sc}`);
+                    }
+                    if (step.estimatedTime) {
+                        filled += `\n   Estimated Time: ${step.estimatedTime}`;
+                    }
+                    if (step.requiredContext && step.requiredContext.length > 0) {
+                        filled += `\n   Required Context: ${step.requiredContext.join(', ')}`;
+                    }
+                    if (step.dependencies && step.dependencies.length > 0) {
+                        filled += `\n   Dependencies: ${step.dependencies.join(', ')}`;
+                    }
+                });
+                
+                // Add history context if available
+                if (taskActionPlan.basedOnHistory && taskActionPlan.historyPattern) {
+                    filled += `\n\nNote: ${taskActionPlan.historyPattern}`;
+                }
+                
+                // Add reference-based steps if applicable
+                if (referenceAssessment && referenceAssessment.processStepsRequiringRefs.length > 0) {
+                    filled += '\n\nAdditional steps requiring references:';
+                    referenceAssessment.processStepsRequiringRefs.forEach((refStep, index) => {
+                        filled += `\n- ${refStep}`;
+                    });
+                }
+            } else if (detailRecommendation.needsBreakdown) {
+                // Fallback to template if no action plan available
                 filled += '\n\nBreak this task into detailed steps:';
                 filled += '\n1. [Step 1 - What exactly needs to happen?]';
                 filled += '\n2. [Step 2 - What exactly needs to happen?]';
@@ -1053,11 +1180,45 @@ export class MLAdvisor {
             }
             if (detailRecommendation.needsMoreDetail) {
                 filled += '\n\nAdd more specific details:';
-                filled += '\n- Include exact names, numbers, or values';
-                filled += '\n- Provide concrete examples';
-                filled += '\n- Specify constraints or requirements';
-                filled += '\n- Describe expected outcomes';
+                
+                // Use action plan steps to suggest specific details
+                if (taskActionPlan && taskActionPlan.steps.length > 0) {
+                    filled += '\n\nBased on ML analysis, consider adding:';
+                    taskActionPlan.steps.forEach(step => {
+                        if (step.requiredContext && step.requiredContext.length > 0) {
+                            filled += `\n- For "${step.action}": ${step.requiredContext.join(', ')}`;
+                        }
+                    });
+                    
+                    // Add prerequisites as details to include
+                    if (taskActionPlan.prerequisites.length > 0) {
+                        filled += '\n\nPrerequisites to have ready:';
+                        taskActionPlan.prerequisites.forEach(prereq => {
+                            filled += `\n- ${prereq}`;
+                        });
+                    }
+                } else {
+                    // Fallback template
+                    filled += '\n- Include exact names, numbers, or values';
+                    filled += '\n- Provide concrete examples';
+                    filled += '\n- Specify constraints or requirements';
+                    filled += '\n- Describe expected outcomes';
+                }
             }
+        } else if (taskActionPlan && taskActionPlan.steps.length > 0 && (prompt.length < 100 || (analysis && analysis.score < 70))) {
+            // Even if not flagged for breakdown, add steps if prompt is short or low quality
+            filled += '\n\n[SUGGESTED TASK BREAKDOWN - Based on ML Analysis]:';
+            filled += `\nComplexity: ${taskActionPlan.complexity.toUpperCase()}`;
+            if (taskActionPlan.totalEstimatedTime) {
+                filled += ` | Estimated Time: ${taskActionPlan.totalEstimatedTime}`;
+            }
+            if (taskActionPlan.basedOnHistory && taskActionPlan.historyPattern) {
+                filled += `\n${taskActionPlan.historyPattern}`;
+            }
+            filled += '\n\nRecommended steps:';
+            taskActionPlan.steps.forEach(step => {
+                filled += `\n${step.stepNumber}. ${step.action}: ${step.description}`;
+            });
         }
         
         // Add format specification if missing
@@ -1133,6 +1294,812 @@ export class MLAdvisor {
             expectedIterations,
             refinementPoints
         };
+    }
+
+    private generateTaskActionPlan(prompt: string, goal: string, analysis: PromptAnalysis, chatHistory?: ChatHistoryContext, referenceAssessment?: ReferenceAssessment): TaskActionPlan {
+        const lower = prompt.toLowerCase();
+        const steps: TaskActionStep[] = [];
+        const prerequisites: string[] = [];
+        let complexity: 'simple' | 'medium' | 'complex' = 'medium';
+        let basedOnHistory = false;
+        let historyPattern: string | undefined;
+        
+        // Define overall goal and planning strategy
+        const overallGoal = `${goal.replace(/_/g, ' ')}: ${prompt.substring(0, 100)}${prompt.length > 100 ? '...' : ''}`;
+        const planningStrategy = `Sequential execution with goal decomposition for ${goal.replace(/_/g, ' ')}`;
+        
+        // Check chat history for similar tasks
+        if (chatHistory && chatHistory.recentMessages.length > 0) {
+            const similarGoals = chatHistory.recentMessages.filter(msg => 
+                msg.goal === goal && msg.prompt.toLowerCase().includes(lower.split(' ').slice(0, 3).join(' '))
+            );
+            
+            if (similarGoals.length > 0) {
+                basedOnHistory = true;
+                historyPattern = `Based on ${similarGoals.length} similar task(s) in chat history`;
+            }
+        }
+        
+        // Generate steps based on goal type
+        switch (goal) {
+            case 'code_generation':
+                complexity = this.assessTaskComplexity(prompt, analysis);
+                steps.push(...this.generateCodeGenerationSteps(prompt, lower, analysis, referenceAssessment, overallGoal));
+                prerequisites.push('Code editor/IDE ready', 'Required dependencies installed');
+                if (referenceAssessment && referenceAssessment.criticalReferencesNeeded.length > 0) {
+                    prerequisites.push('API documentation available', 'Library references ready');
+                }
+                break;
+                
+            case 'debugging':
+                complexity = 'medium';
+                steps.push(...this.generateDebuggingSteps(prompt, lower, analysis, chatHistory, overallGoal));
+                prerequisites.push('Error reproduction steps', 'Access to logs/debugger');
+                break;
+                
+            case 'refactoring':
+                complexity = this.assessTaskComplexity(prompt, analysis);
+                steps.push(...this.generateRefactoringSteps(prompt, lower, analysis, overallGoal));
+                prerequisites.push('Original code available', 'Test suite ready');
+                break;
+                
+            case 'code_review':
+                complexity = 'medium';
+                steps.push(...this.generateCodeReviewSteps(prompt, lower, analysis, overallGoal));
+                prerequisites.push('Code to review', 'Coding standards/guidelines');
+                break;
+                
+            case 'test_generation':
+                complexity = 'medium';
+                steps.push(...this.generateTestGenerationSteps(prompt, lower, analysis, overallGoal));
+                prerequisites.push('Code to test', 'Testing framework installed');
+                break;
+                
+            case 'explanation':
+                complexity = 'simple';
+                steps.push(...this.generateExplanationSteps(prompt, lower, analysis, overallGoal));
+                prerequisites.push('Topic/concept identified', 'Target audience level known');
+                break;
+                
+            case 'transformation':
+                complexity = 'medium';
+                steps.push(...this.generateTransformationSteps(prompt, lower, analysis, overallGoal));
+                prerequisites.push('Source code/data available', 'Target format specified');
+                break;
+                
+            default:
+                steps.push(...this.generateGenericSteps(prompt, goal, analysis, overallGoal));
+                complexity = 'medium';
+        }
+        
+        // Estimate total time based on complexity and step count
+        const totalTime = this.estimateTotalTime(complexity, steps.length);
+        
+        // AGENTIC: Build goal hierarchy showing how goals relate
+        const goalHierarchy = this.buildGoalHierarchy(overallGoal, steps);
+        
+        return {
+            goal,
+            overallGoal,
+            planningStrategy,
+            steps,
+            totalEstimatedTime: totalTime,
+            complexity,
+            prerequisites,
+            basedOnHistory,
+            historyPattern,
+            goalHierarchy
+        };
+    }
+    
+    private determineOverallGoal(prompt: string, goal: string, analysis: PromptAnalysis): string {
+        // Agentic reasoning: Extract the true objective from the prompt
+        const lower = prompt.toLowerCase();
+        
+        // Look for explicit goal statements
+        const goalPatterns = [
+            /(?:i want to|i need to|goal is|objective is|trying to|aiming to|purpose is)\s+(.+?)(?:\.|$)/i,
+            /(?:create|build|make|develop|implement|design)\s+(.+?)(?:that|which|with|for)/i,
+            /(?:help me|assist with|need help|want)\s+(.+?)(?:\.|$)/i
+        ];
+        
+        for (const pattern of goalPatterns) {
+            const match = prompt.match(pattern);
+            if (match && match[1]) {
+                return match[1].trim();
+            }
+        }
+        
+        // Fallback: Generate goal from task type and key phrases
+        const keyPhrases = prompt.split(/[.!?]/).slice(0, 2).join(' ').trim();
+        if (keyPhrases.length > 10 && keyPhrases.length < 200) {
+            return keyPhrases;
+        }
+        
+        // Default based on goal type
+        const goalDescriptions: Record<string, string> = {
+            'code_generation': 'Generate functional, well-structured code that meets the specified requirements',
+            'debugging': 'Identify and fix the root cause of the issue',
+            'refactoring': 'Improve code quality while maintaining functionality',
+            'code_review': 'Review code for quality, security, and best practices',
+            'test_generation': 'Create comprehensive tests that verify correctness',
+            'explanation': 'Provide clear, understandable explanation of the concept',
+            'transformation': 'Transform code/data from source format to target format accurately'
+        };
+        
+        return goalDescriptions[goal] || 'Complete the requested task effectively';
+    }
+    
+    private planStrategy(prompt: string, goal: string, analysis: PromptAnalysis, chatHistory?: ChatHistoryContext, referenceAssessment?: ReferenceAssessment): string {
+        // Agentic planning: Determine the best approach based on multiple factors
+        const factors: string[] = [];
+        
+        // Factor 1: Complexity
+        const complexity = this.assessTaskComplexity(prompt, analysis);
+        if (complexity === 'complex') {
+            factors.push('incremental development with frequent validation');
+        } else if (complexity === 'simple') {
+            factors.push('direct implementation approach');
+        } else {
+            factors.push('structured approach with clear phases');
+        }
+        
+        // Factor 2: Reference requirements
+        if (referenceAssessment && referenceAssessment.criticalReferencesNeeded.length > 0) {
+            factors.push('reference-driven development');
+            factors.push('verify against documentation at each step');
+        }
+        
+        // Factor 3: Chat history patterns
+        if (chatHistory && chatHistory.patterns.length > 0) {
+            if (chatHistory.patterns.some(p => p.includes('Frequent goal'))) {
+                factors.push('leverage patterns from previous similar tasks');
+            }
+        }
+        
+        // Factor 4: Prompt quality
+        if (analysis.score < 60) {
+            factors.push('iterative refinement with clarification');
+        } else if (analysis.score >= 80) {
+            factors.push('confident execution based on clear requirements');
+        }
+        
+        // Factor 5: Goal-specific strategies
+        if (goal === 'code_generation') {
+            factors.push('test-driven development if tests mentioned');
+        } else if (goal === 'debugging') {
+            factors.push('systematic isolation and root cause analysis');
+        } else if (goal === 'refactoring') {
+            factors.push('incremental changes with test verification');
+        }
+        
+        return factors.length > 0 
+            ? `Strategy: ${factors.join(', ')}.`
+            : 'Strategy: Standard approach with clear milestones.';
+    }
+    
+    private buildGoalHierarchy(overallGoal: string, steps: TaskActionStep[]): { overall: string; phaseGoals: { phase: string; goal: string; steps: number[] }[] } {
+        // Organize steps into phases with phase-level goals
+        const phaseGoals: { phase: string; goal: string; steps: number[] }[] = [];
+        
+        // Group steps into logical phases
+        if (steps.length >= 3) {
+            // Phase 1: Planning/Preparation (first 1-2 steps)
+            const planningSteps = steps.slice(0, Math.min(2, Math.floor(steps.length / 3)));
+            if (planningSteps.length > 0) {
+                phaseGoals.push({
+                    phase: 'Planning & Preparation',
+                    goal: 'Understand requirements and prepare necessary resources',
+                    steps: planningSteps.map(s => s.stepNumber)
+                });
+            }
+            
+            // Phase 2: Implementation (middle steps)
+            const midStart = planningSteps.length;
+            const midEnd = Math.min(midStart + Math.floor(steps.length / 2), steps.length - 1);
+            if (midEnd > midStart) {
+                const implementationSteps = steps.slice(midStart, midEnd);
+                phaseGoals.push({
+                    phase: 'Implementation',
+                    goal: 'Execute the core work to achieve the objective',
+                    steps: implementationSteps.map(s => s.stepNumber)
+                });
+            }
+            
+            // Phase 3: Validation/Refinement (last steps)
+            if (midEnd < steps.length) {
+                const validationSteps = steps.slice(midEnd);
+                phaseGoals.push({
+                    phase: 'Validation & Refinement',
+                    goal: 'Verify correctness and improve quality',
+                    steps: validationSteps.map(s => s.stepNumber)
+                });
+            }
+        }
+        
+        return {
+            overall: overallGoal,
+            phaseGoals
+        };
+    }
+    
+    private assessTaskComplexity(prompt: string, analysis: PromptAnalysis): 'simple' | 'medium' | 'complex' {
+        const wordCount = prompt.split(/\s+/).length;
+        const hasMultipleComponents = /(and|also|plus|additionally|multiple|several)/i.test(prompt);
+        const hasComplexLogic = /(algorithm|optimize|performance|scalability|distributed|concurrent|async)/i.test(prompt);
+        
+        if (wordCount > 200 || hasMultipleComponents && hasComplexLogic) {
+            return 'complex';
+        } else if (wordCount > 100 || hasMultipleComponents || hasComplexLogic) {
+            return 'medium';
+        }
+        return 'simple';
+    }
+    
+    private generateStepGoal(action: string, stepNum: number, totalSteps: number, overallGoal: string, goal: string): string {
+        // Agentic goal generation for each step
+        const goalTemplates: Record<string, string[]> = {
+            'Analyze Requirements': [
+                'Establish clear understanding of what needs to be built and all constraints',
+                'Document all requirements, inputs, outputs, and edge cases',
+                'Create a complete specification for the task'
+            ],
+            'Design Architecture': [
+                'Create a scalable, maintainable system design',
+                'Plan component structure and interactions',
+                'Design the system architecture that supports requirements'
+            ],
+            'Gather Required References': [
+                'Collect all necessary documentation and references',
+                'Ensure access to correct API specifications and examples',
+                'Prepare reference materials for accurate implementation'
+            ],
+            'Implement Core Logic': [
+                'Implement working solution that meets core requirements',
+                'Write the main functionality that achieves the primary goal',
+                'Create the core implementation that solves the problem'
+            ],
+            'Add Error Handling': [
+                'Make the solution robust and production-ready',
+                'Ensure graceful handling of edge cases and errors',
+                'Add comprehensive error handling for reliability'
+            ],
+            'Write Unit Tests': [
+                'Verify correctness and prevent regressions',
+                'Ensure the solution works as expected',
+                'Create tests that validate functionality'
+            ],
+            'Review and Refine': [
+                'Ensure code quality and best practices',
+                'Improve the solution to production quality',
+                'Polish and optimize the final implementation'
+            ]
+        };
+        
+        return goalTemplates[action]?.[0] || `Complete ${action.toLowerCase()} to progress toward: ${overallGoal}`;
+    }
+    
+    private generateCodeGenerationSteps(prompt: string, lower: string, analysis: PromptAnalysis, referenceAssessment?: ReferenceAssessment, overallGoal?: string): TaskActionStep[] {
+        const steps: TaskActionStep[] = [];
+        let stepNum = 1;
+        // Calculate total steps dynamically
+        let estimatedTotalSteps = 4; // Base: Analyze, Design (if complex), Implement, Review
+        if (this.assessTaskComplexity(prompt, analysis) !== 'simple') estimatedTotalSteps++;
+        if (lower.includes('error') || lower.includes('exception') || lower.includes('handle')) estimatedTotalSteps++;
+        if (lower.includes('test') || this.assessTaskComplexity(prompt, analysis) === 'complex') estimatedTotalSteps++;
+        if (referenceAssessment && referenceAssessment.criticalReferencesNeeded.length > 0) estimatedTotalSteps++;
+        const totalSteps = estimatedTotalSteps;
+        
+        const stepGoal1 = this.generateStepGoal('Analyze Requirements', 1, totalSteps, overallGoal || 'Complete the task', 'code_generation');
+        steps.push({
+            stepNumber: stepNum++,
+            action: 'Analyze Requirements',
+            description: 'Break down the prompt to identify: what needs to be created, inputs/outputs, constraints, and edge cases',
+            why: 'Understanding requirements prevents scope creep and ensures all needs are met',
+            goal: stepGoal1,
+            estimatedTime: '5-10 min',
+            requiredContext: ['Full prompt text', 'Any examples provided']
+        });
+        
+        if (this.assessTaskComplexity(prompt, analysis) !== 'simple') {
+            const stepGoal2 = this.generateStepGoal('Design Architecture', stepNum, totalSteps, overallGoal || 'Complete the task', 'code_generation');
+            steps.push({
+                stepNumber: stepNum++,
+                action: 'Design Architecture',
+                description: 'Plan the structure: classes, functions, data flow, and relationships between components',
+                why: 'Good architecture makes code maintainable and easier to implement',
+                goal: stepGoal2,
+                subGoals: [
+                    'Define component structure',
+                    'Establish data flow patterns',
+                    'Plan component interactions',
+                    'Ensure separation of concerns'
+                ],
+                estimatedTime: '10-15 min',
+                dependencies: ['Step 1 completed'],
+                successCriteria: [
+                    'Architecture diagram or structure is defined',
+                    'Component responsibilities are clear',
+                    'Data flow is mapped',
+                    'Design supports requirements'
+                ]
+            });
+        }
+        
+        if (referenceAssessment && referenceAssessment.criticalReferencesNeeded.length > 0) {
+            const stepGoalRef = this.generateStepGoal('Gather Required References', stepNum, totalSteps, overallGoal || 'Complete the task', 'code_generation');
+            steps.push({
+                stepNumber: stepNum++,
+                action: 'Gather Required References',
+                goal: stepGoalRef,
+                description: `Collect: ${referenceAssessment.criticalReferencesNeeded.map(r => r.type).join(', ')}`,
+                why: 'References ensure correct API usage, patterns, and best practices',
+                estimatedTime: '5-10 min',
+                requiredContext: referenceAssessment.criticalReferencesNeeded.map(r => r.description)
+            });
+        }
+        
+        const stepGoal4 = this.generateStepGoal('Implement Core Logic', stepNum, totalSteps, overallGoal || 'Complete the task', 'code_generation');
+        steps.push({
+            stepNumber: stepNum++,
+            action: 'Implement Core Logic',
+            goal: stepGoal4,
+            description: 'Write the main functionality: data structures, algorithms, and business logic',
+            why: 'Core logic is the foundation - get it right before adding features',
+            estimatedTime: this.assessTaskComplexity(prompt, analysis) === 'complex' ? '30-60 min' : '15-30 min',
+            dependencies: referenceAssessment && referenceAssessment.criticalReferencesNeeded.length > 0 
+                ? [`Step ${stepNum - 1} completed`] 
+                : ['Step 1 completed']
+        });
+        
+        if (lower.includes('error') || lower.includes('exception') || lower.includes('handle')) {
+            const stepGoal5 = this.generateStepGoal('Add Error Handling', stepNum, totalSteps, overallGoal || 'Complete the task', 'code_generation');
+            steps.push({
+                stepNumber: stepNum++,
+                action: 'Add Error Handling',
+                goal: stepGoal5,
+                description: 'Implement try-catch blocks, validation, and graceful error messages',
+                why: 'Robust error handling prevents crashes and improves user experience',
+                estimatedTime: '10-15 min',
+                dependencies: [`Step ${stepNum - 1} completed`]
+            });
+        }
+        
+        if (lower.includes('test') || this.assessTaskComplexity(prompt, analysis) === 'complex') {
+            const stepGoal6 = this.generateStepGoal('Write Unit Tests', stepNum, totalSteps, overallGoal || 'Complete the task', 'code_generation');
+            steps.push({
+                stepNumber: stepNum++,
+                action: 'Write Unit Tests',
+                goal: stepGoal6,
+                description: 'Create tests for core functionality, edge cases, and error scenarios',
+                why: 'Tests verify correctness and prevent regressions',
+                estimatedTime: '15-20 min',
+                dependencies: [`Step ${stepNum - 2} completed`]
+            });
+        }
+        
+        const stepGoalFinal = this.generateStepGoal('Review and Refine', stepNum, totalSteps, overallGoal || 'Complete the task', 'code_generation');
+        steps.push({
+            stepNumber: stepNum++,
+            action: 'Review and Refine',
+            goal: stepGoalFinal,
+            description: 'Check code quality: readability, performance, documentation, and adherence to best practices',
+            why: 'Review catches issues early and improves code quality',
+            estimatedTime: '10-15 min',
+            dependencies: [`Step ${stepNum - 1} completed`]
+        });
+        
+        return steps;
+    }
+    
+    private generateDebuggingSteps(prompt: string, lower: string, analysis: PromptAnalysis, chatHistory?: ChatHistoryContext, overallGoal?: string): TaskActionStep[] {
+        const steps: TaskActionStep[] = [];
+        let stepNum = 1;
+        const totalSteps = 6;
+        
+        const stepGoal1 = this.generateStepGoal('Reproduce the Error', 1, totalSteps, overallGoal || 'Fix the issue', 'debugging');
+        steps.push({
+            stepNumber: stepNum++,
+            action: 'Reproduce the Error',
+            goal: stepGoal1,
+            description: 'Run the code and confirm you can consistently reproduce the issue',
+            why: 'Reproducibility is essential for effective debugging',
+            estimatedTime: '5-10 min',
+            requiredContext: ['Error message', 'Steps to reproduce']
+        });
+        
+        const stepGoal2 = this.generateStepGoal('Gather Error Details', 2, 6, overallGoal || 'Fix the issue', 'debugging');
+        steps.push({
+            stepNumber: stepNum++,
+            action: 'Gather Error Details',
+            description: 'Collect: full error message, stack trace, input data, and environment details',
+            why: 'Complete error information helps identify root cause faster',
+            goal: stepGoal2,
+            estimatedTime: '5 min',
+            dependencies: ['Step 1 completed']
+        });
+        
+        const stepGoal3 = this.generateStepGoal('Isolate the Problem', 3, 6, overallGoal || 'Fix the issue', 'debugging');
+        steps.push({
+            stepNumber: stepNum++,
+            action: 'Isolate the Problem',
+            description: 'Narrow down: comment out code sections, add print statements, or use debugger to find the failing line',
+            why: 'Isolation helps focus on the actual problem area',
+            goal: stepGoal3,
+            estimatedTime: '10-20 min',
+            dependencies: ['Step 2 completed']
+        });
+        
+        const stepGoal4 = this.generateStepGoal('Analyze Root Cause', 4, 6, overallGoal || 'Fix the issue', 'debugging');
+        steps.push({
+            stepNumber: stepNum++,
+            action: 'Analyze Root Cause',
+            description: 'Understand why it fails: check variable values, data types, logic flow, and edge cases',
+            why: 'Understanding root cause leads to proper fix, not just symptom treatment',
+            goal: stepGoal4,
+            estimatedTime: '10-15 min',
+            dependencies: ['Step 3 completed']
+        });
+        
+        const stepGoal5 = this.generateStepGoal('Implement Fix', 5, 6, overallGoal || 'Fix the issue', 'debugging');
+        steps.push({
+            stepNumber: stepNum++,
+            action: 'Implement Fix',
+            description: 'Apply the solution: fix the bug, handle edge cases, and ensure logic is correct',
+            why: 'The fix should address root cause, not just symptoms',
+            goal: stepGoal5,
+            estimatedTime: '10-20 min',
+            dependencies: ['Step 4 completed']
+        });
+        
+        const stepGoal6 = this.generateStepGoal('Verify Fix', 6, 6, overallGoal || 'Fix the issue', 'debugging');
+        steps.push({
+            stepNumber: stepNum++,
+            action: 'Verify Fix',
+            description: 'Test: reproduce original error (should be fixed), test edge cases, check for regressions',
+            why: 'Verification ensures fix works and doesn\'t break other functionality',
+            goal: stepGoal6,
+            estimatedTime: '10 min',
+            dependencies: ['Step 5 completed']
+        });
+        
+        return steps;
+    }
+    
+    private generateRefactoringSteps(prompt: string, lower: string, analysis: PromptAnalysis, overallGoal?: string): TaskActionStep[] {
+        const steps: TaskActionStep[] = [];
+        let stepNum = 1;
+        const totalSteps = 5;
+        
+        const stepGoal1 = this.generateStepGoal('Understand Current Code', 1, totalSteps, overallGoal || 'Refactor the code', 'refactoring');
+        steps.push({
+            stepNumber: stepNum++,
+            action: 'Understand Current Code',
+            goal: stepGoal1,
+            description: 'Read and analyze existing code: structure, dependencies, and current behavior',
+            why: 'Understanding prevents breaking changes during refactoring',
+            estimatedTime: '10-15 min',
+            requiredContext: ['Original code']
+        });
+        
+        const stepGoal2 = this.generateStepGoal('Run Existing Tests', 2, totalSteps, overallGoal || 'Refactor the code', 'refactoring');
+        steps.push({
+            stepNumber: stepNum++,
+            action: 'Run Existing Tests',
+            goal: stepGoal2,
+            description: 'Ensure all tests pass before refactoring to establish baseline',
+            why: 'Tests verify behavior hasn\'t changed after refactoring',
+            estimatedTime: '5 min',
+            dependencies: ['Step 1 completed']
+        });
+        
+        const stepGoal3 = this.generateStepGoal('Identify Refactoring Targets', 3, totalSteps, overallGoal || 'Refactor the code', 'refactoring');
+        steps.push({
+            stepNumber: stepNum++,
+            action: 'Identify Refactoring Targets',
+            goal: stepGoal3,
+            description: 'Find: duplicated code, long functions, complex logic, or design issues',
+            why: 'Targeted refactoring is more effective than random changes',
+            estimatedTime: '10 min',
+            dependencies: ['Step 2 completed']
+        });
+        
+        const stepGoal4 = this.generateStepGoal('Apply Refactoring', 4, totalSteps, overallGoal || 'Refactor the code', 'refactoring');
+        steps.push({
+            stepNumber: stepNum++,
+            action: 'Apply Refactoring',
+            goal: stepGoal4,
+            description: 'Make changes incrementally: extract functions, rename variables, simplify logic',
+            why: 'Incremental changes are safer and easier to verify',
+            estimatedTime: '20-30 min',
+            dependencies: ['Step 3 completed']
+        });
+        
+        const stepGoal5 = this.generateStepGoal('Verify Tests Still Pass', 5, totalSteps, overallGoal || 'Refactor the code', 'refactoring');
+        steps.push({
+            stepNumber: stepNum++,
+            action: 'Verify Tests Still Pass',
+            goal: stepGoal5,
+            description: 'Run tests after each refactoring step to ensure behavior is preserved',
+            why: 'Continuous verification catches issues early',
+            estimatedTime: '5 min',
+            dependencies: ['Step 4 completed']
+        });
+        
+        return steps;
+    }
+    
+    private generateCodeReviewSteps(prompt: string, lower: string, analysis: PromptAnalysis, overallGoal?: string): TaskActionStep[] {
+        const steps: TaskActionStep[] = [];
+        let stepNum = 1;
+        const totalSteps = 5;
+        
+        const stepGoal1 = this.generateStepGoal('Initial Read-Through', 1, totalSteps, overallGoal || 'Review the code', 'code_review');
+        steps.push({
+            stepNumber: stepNum++,
+            action: 'Initial Read-Through',
+            goal: stepGoal1,
+            description: 'Read the code once to understand what it does and its overall structure',
+            why: 'First pass gives context for detailed review',
+            estimatedTime: '5-10 min',
+            requiredContext: ['Code to review']
+        });
+        
+        const stepGoal2 = this.generateStepGoal('Check Functionality', 2, totalSteps, overallGoal || 'Review the code', 'code_review');
+        steps.push({
+            stepNumber: stepNum++,
+            action: 'Check Functionality',
+            goal: stepGoal2,
+            description: 'Verify logic correctness: algorithms, edge cases, and expected behavior',
+            why: 'Functional correctness is the primary concern',
+            estimatedTime: '10-15 min',
+            dependencies: ['Step 1 completed']
+        });
+        
+        const stepGoal3 = this.generateStepGoal('Review Code Quality', 3, totalSteps, overallGoal || 'Review the code', 'code_review');
+        steps.push({
+            stepNumber: stepNum++,
+            action: 'Review Code Quality',
+            goal: stepGoal3,
+            description: 'Check: readability, naming, structure, and adherence to coding standards',
+            why: 'Code quality affects maintainability',
+            estimatedTime: '10 min',
+            dependencies: ['Step 2 completed']
+        });
+        
+        const stepGoal4 = this.generateStepGoal('Check Security & Performance', 4, totalSteps, overallGoal || 'Review the code', 'code_review');
+        steps.push({
+            stepNumber: stepNum++,
+            action: 'Check Security & Performance',
+            goal: stepGoal4,
+            description: 'Look for: security vulnerabilities, performance issues, and resource leaks',
+            why: 'Security and performance are critical for production code',
+            estimatedTime: '10-15 min',
+            dependencies: ['Step 3 completed']
+        });
+        
+        const stepGoal5 = this.generateStepGoal('Provide Feedback', 5, totalSteps, overallGoal || 'Review the code', 'code_review');
+        steps.push({
+            stepNumber: stepNum++,
+            action: 'Provide Feedback',
+            goal: stepGoal5,
+            description: 'Document: issues found, suggestions for improvement, and positive aspects',
+            why: 'Constructive feedback helps improve code quality',
+            estimatedTime: '10 min',
+            dependencies: ['Step 4 completed']
+        });
+        
+        return steps;
+    }
+    
+    private generateTestGenerationSteps(prompt: string, lower: string, analysis: PromptAnalysis, overallGoal?: string): TaskActionStep[] {
+        const steps: TaskActionStep[] = [];
+        let stepNum = 1;
+        const totalSteps = 4;
+        
+        const stepGoal1 = this.generateStepGoal('Understand Code Under Test', 1, totalSteps, overallGoal || 'Generate tests', 'test_generation');
+        steps.push({
+            stepNumber: stepNum++,
+            action: 'Understand Code Under Test',
+            goal: stepGoal1,
+            description: 'Analyze the code: inputs, outputs, edge cases, and expected behavior',
+            why: 'Understanding ensures comprehensive test coverage',
+            estimatedTime: '10 min',
+            requiredContext: ['Code to test']
+        });
+        
+        const stepGoal2 = this.generateStepGoal('Identify Test Cases', 2, totalSteps, overallGoal || 'Generate tests', 'test_generation');
+        steps.push({
+            stepNumber: stepNum++,
+            action: 'Identify Test Cases',
+            goal: stepGoal2,
+            description: 'List: happy path, edge cases, error scenarios, and boundary conditions',
+            why: 'Comprehensive test cases ensure robust testing',
+            estimatedTime: '10 min',
+            dependencies: ['Step 1 completed']
+        });
+        
+        const stepGoal3 = this.generateStepGoal('Write Unit Tests', 3, totalSteps, overallGoal || 'Generate tests', 'test_generation');
+        steps.push({
+            stepNumber: stepNum++,
+            action: 'Write Unit Tests',
+            goal: stepGoal3,
+            description: 'Implement tests: arrange-act-assert pattern, mock dependencies, test each function',
+            why: 'Unit tests verify individual components work correctly',
+            estimatedTime: '20-30 min',
+            dependencies: ['Step 2 completed']
+        });
+        
+        const stepGoal4 = this.generateStepGoal('Run Tests', 4, totalSteps, overallGoal || 'Generate tests', 'test_generation');
+        steps.push({
+            stepNumber: stepNum++,
+            action: 'Run Tests',
+            goal: stepGoal4,
+            description: 'Execute tests and verify they pass, fix any issues',
+            why: 'Running tests validates they work correctly',
+            estimatedTime: '5 min',
+            dependencies: ['Step 3 completed']
+        });
+        
+        return steps;
+    }
+    
+    private generateExplanationSteps(prompt: string, lower: string, analysis: PromptAnalysis, overallGoal?: string): TaskActionStep[] {
+        const steps: TaskActionStep[] = [];
+        let stepNum = 1;
+        const totalSteps = 3;
+        
+        const stepGoal1 = this.generateStepGoal('Identify Core Concepts', 1, totalSteps, overallGoal || 'Explain the concept', 'explanation');
+        steps.push({
+            stepNumber: stepNum++,
+            action: 'Identify Core Concepts',
+            goal: stepGoal1,
+            description: 'Extract key concepts, terminology, and fundamental ideas to explain',
+            why: 'Core concepts form the foundation of understanding',
+            estimatedTime: '5 min',
+            requiredContext: ['Topic/concept to explain']
+        });
+        
+        const stepGoal2 = this.generateStepGoal('Structure Explanation', 2, totalSteps, overallGoal || 'Explain the concept', 'explanation');
+        steps.push({
+            stepNumber: stepNum++,
+            action: 'Structure Explanation',
+            goal: stepGoal2,
+            description: 'Organize: introduction, main concepts, examples, and summary',
+            why: 'Good structure improves comprehension',
+            estimatedTime: '5 min',
+            dependencies: ['Step 1 completed']
+        });
+        
+        const stepGoal3 = this.generateStepGoal('Add Examples', 3, totalSteps, overallGoal || 'Explain the concept', 'explanation');
+        steps.push({
+            stepNumber: stepNum++,
+            action: 'Add Examples',
+            goal: stepGoal3,
+            description: 'Include: concrete examples, analogies, and practical use cases',
+            why: 'Examples make abstract concepts concrete and understandable',
+            estimatedTime: '10 min',
+            dependencies: ['Step 2 completed']
+        });
+        
+        return steps;
+    }
+    
+    private generateTransformationSteps(prompt: string, lower: string, analysis: PromptAnalysis, overallGoal?: string): TaskActionStep[] {
+        const steps: TaskActionStep[] = [];
+        let stepNum = 1;
+        const totalSteps = 5;
+        
+        const stepGoal1 = this.generateStepGoal('Analyze Source Format', 1, totalSteps, overallGoal || 'Transform the data', 'transformation');
+        steps.push({
+            stepNumber: stepNum++,
+            action: 'Analyze Source Format',
+            goal: stepGoal1,
+            description: 'Understand: structure, data types, and patterns in source code/data',
+            why: 'Understanding source format is essential for accurate transformation',
+            estimatedTime: '10 min',
+            requiredContext: ['Source code/data']
+        });
+        
+        const stepGoal2 = this.generateStepGoal('Define Target Format', 2, totalSteps, overallGoal || 'Transform the data', 'transformation');
+        steps.push({
+            stepNumber: stepNum++,
+            action: 'Define Target Format',
+            goal: stepGoal2,
+            description: 'Specify: target structure, required fields, and transformation rules',
+            why: 'Clear target specification guides transformation',
+            estimatedTime: '5 min',
+            dependencies: ['Step 1 completed']
+        });
+        
+        const stepGoal3 = this.generateStepGoal('Map Transformation Logic', 3, totalSteps, overallGoal || 'Transform the data', 'transformation');
+        steps.push({
+            stepNumber: stepNum++,
+            action: 'Map Transformation Logic',
+            goal: stepGoal3,
+            description: 'Create mapping: source fields to target fields, data conversions, and validations',
+            why: 'Mapping ensures all data is correctly transformed',
+            estimatedTime: '15 min',
+            dependencies: ['Step 2 completed']
+        });
+        
+        const stepGoal4 = this.generateStepGoal('Implement Transformation', 4, totalSteps, overallGoal || 'Transform the data', 'transformation');
+        steps.push({
+            stepNumber: stepNum++,
+            action: 'Implement Transformation',
+            goal: stepGoal4,
+            description: 'Write code to perform the transformation with error handling',
+            why: 'Implementation executes the transformation logic',
+            estimatedTime: '20-30 min',
+            dependencies: ['Step 3 completed']
+        });
+        
+        const stepGoal5 = this.generateStepGoal('Verify Output', 5, totalSteps, overallGoal || 'Transform the data', 'transformation');
+        steps.push({
+            stepNumber: stepNum++,
+            action: 'Verify Output',
+            goal: stepGoal5,
+            description: 'Test transformation: validate output format, check data accuracy, test edge cases',
+            why: 'Verification ensures transformation works correctly',
+            estimatedTime: '10 min',
+            dependencies: ['Step 4 completed']
+        });
+        
+        return steps;
+    }
+    
+    private generateGenericSteps(prompt: string, goal: string, analysis: PromptAnalysis, overallGoal?: string): TaskActionStep[] {
+        const totalSteps = 4;
+        return [
+            {
+                stepNumber: 1,
+                action: 'Understand Requirements',
+                goal: this.generateStepGoal('Understand Requirements', 1, totalSteps, overallGoal || 'Complete the task', goal),
+                description: 'Analyze what needs to be accomplished',
+                why: 'Clear understanding prevents mistakes',
+                estimatedTime: '10 min'
+            },
+            {
+                stepNumber: 2,
+                action: 'Plan Approach',
+                goal: this.generateStepGoal('Plan Approach', 2, totalSteps, overallGoal || 'Complete the task', goal),
+                description: 'Determine the best method to achieve the goal',
+                why: 'Planning improves efficiency',
+                estimatedTime: '10 min',
+                dependencies: ['Step 1 completed']
+            },
+            {
+                stepNumber: 3,
+                action: 'Execute',
+                goal: this.generateStepGoal('Execute', 3, totalSteps, overallGoal || 'Complete the task', goal),
+                description: 'Implement the planned approach',
+                why: 'Execution achieves the goal',
+                estimatedTime: '20-30 min',
+                dependencies: ['Step 2 completed']
+            },
+            {
+                stepNumber: 4,
+                action: 'Verify Results',
+                goal: this.generateStepGoal('Verify Results', 4, totalSteps, overallGoal || 'Complete the task', goal),
+                description: 'Check that the outcome meets requirements',
+                why: 'Verification ensures quality',
+                estimatedTime: '10 min',
+                dependencies: ['Step 3 completed']
+            }
+        ];
+    }
+    
+    private estimateTotalTime(complexity: 'simple' | 'medium' | 'complex', stepCount: number): string {
+        const baseTimePerStep = complexity === 'simple' ? 10 : complexity === 'medium' ? 15 : 25;
+        const totalMinutes = stepCount * baseTimePerStep;
+        
+        if (totalMinutes < 60) {
+            return `${totalMinutes} minutes`;
+        } else {
+            const hours = Math.floor(totalMinutes / 60);
+            const minutes = totalMinutes % 60;
+            return minutes > 0 ? `${hours}h ${minutes}m` : `${hours} hour${hours > 1 ? 's' : ''}`;
+        }
     }
 
     private generateVerificationChecklist(prompt: string, goal: string, format: FormatRecommendation): string[] {

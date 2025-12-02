@@ -116,8 +116,8 @@ export function activate(context: vscode.ExtensionContext) {
                 // Get chat history context
                 const historyContext = chatHistory.getContextForAnalysis();
                 
-                // Analyze with history
-                const recommendations = mlAdvisor.analyzeAndRecommend(prompt, undefined, historyContext);
+                // Analyze with history (now async due to ML model)
+                const recommendations = await mlAdvisor.analyzeAndRecommend(prompt, undefined, historyContext);
                 
                 // Add message to history with metadata
                 chatHistory.addMessage(prompt, {
@@ -128,7 +128,7 @@ export function activate(context: vscode.ExtensionContext) {
                 
                 progress.report({ increment: 100 });
                 
-                showMLRecommendationsPanel(recommendations, prompt, historyContext);
+                await showMLRecommendationsPanel(recommendations, prompt, historyContext);
             });
         }
     );
@@ -191,9 +191,9 @@ export function activate(context: vscode.ExtensionContext) {
                     cancellable: false
                 }, async (progress) => {
                     progress.report({ increment: 0 });
-                    const recommendations = mlAdvisor.analyzeAndRecommend(clipboardText);
+                    const recommendations = await mlAdvisor.analyzeAndRecommend(clipboardText);
                     progress.report({ increment: 100 });
-                    showMLRecommendationsPanel(recommendations, clipboardText);
+                    await showMLRecommendationsPanel(recommendations, clipboardText);
                 });
             } else {
                 // Quick improve
@@ -317,7 +317,7 @@ function generateAnalysisHTML(analysis: PromptAnalysis, improvedPrompt: string):
 </html>`;
 }
 
-function showMLRecommendationsPanel(recommendations: MLRecommendations, originalPrompt: string, chatHistory?: any) {
+async function showMLRecommendationsPanel(recommendations: MLRecommendations, originalPrompt: string, chatHistory?: any) {
     const panel = vscode.window.createWebviewPanel(
         'mlRecommendations',
         'ML-Powered Prompt Recommendations',
@@ -727,14 +727,188 @@ function generateMLRecommendationsHTML(rec: MLRecommendations, original: string,
     ` : ''}
 
     <div class="section">
-        <h2>✨ Enhanced Prompt</h2>
-        <p>The ML advisor has filled in missing parts and optimized your prompt:</p>
-        <div class="filled-prompt">${escapeHtml(rec.filledPrompt)}</div>
-        <button class="btn btn-primary" onclick="copyPrompt()">Copy Enhanced Prompt</button>
+        <h2>✨ Enhanced Prompt (Agentic)</h2>
+        ${rec.agenticPrompt ? `
+        <div style="background: #4CAF50; color: white; padding: 10px; border-radius: 5px; margin-bottom: 15px;">
+            <strong>🤖 Agentic Planning Enabled</strong>
+            <p style="margin: 5px 0 0 0; font-size: 0.9em;">Goal decomposition, step planning, and automatic optimization applied</p>
+        </div>
+        <div style="margin-bottom: 15px;">
+            <h3>Agentic Plan Summary:</h3>
+            <p><strong>Overall Goal:</strong> ${escapeHtml(rec.agenticPrompt.plan.overallGoal.replace(/_/g, ' '))}</p>
+            <p><strong>Complexity:</strong> <span class="badge badge-${rec.agenticPrompt.plan.estimatedComplexity === 'simple' ? 'success' : rec.agenticPrompt.plan.estimatedComplexity === 'medium' ? 'info' : 'warning'}">${rec.agenticPrompt.plan.estimatedComplexity.toUpperCase()}</span></p>
+            <p><strong>Confidence:</strong> ${rec.agenticPrompt.plan.confidence}%</p>
+            <p><strong>Steps with Goals:</strong> ${rec.agenticPrompt.plan.stepGoals.length}</p>
+        </div>
+        <details style="margin-bottom: 15px;">
+            <summary style="cursor: pointer; font-weight: bold; color: #2196F3;">📋 View Step Goals & Plan</summary>
+            <div style="margin-top: 10px; padding: 10px; background: var(--vscode-editor-background); border-radius: 5px;">
+                ${rec.agenticPrompt.plan.stepGoals.map(step => {
+                    // Get AI-determined success criteria if available
+                    const aiCriteria = rec.agenticPrompt?.aiDeterminedSuccessCriteria?.get(step.stepNumber) || step.successCriteria;
+                    return `
+                <div style="margin-bottom: 15px; padding: 10px; border-left: 3px solid #2196F3;">
+                    <strong>Step ${step.stepNumber}: ${escapeHtml(step.goal)}</strong>
+                    <p style="margin: 5px 0; color: #666; font-size: 0.9em;">${escapeHtml(step.rationale)}</p>
+                    <div style="margin-top: 8px;">
+                        <strong>Sub-goals:</strong>
+                        <ul style="margin: 5px 0; padding-left: 20px;">
+                            ${step.subGoals.map(sg => `<li>${escapeHtml(sg)}</li>`).join('')}
+                        </ul>
+                    </div>
+                    <div style="margin-top: 8px;">
+                        <strong>Success Criteria (AI-Determined):</strong>
+                        <div style="background: #E8F5E9; padding: 8px; border-radius: 4px; margin-top: 5px;">
+                            <ul style="margin: 5px 0; padding-left: 20px;">
+                                ${aiCriteria.map(sc => `<li>✓ ${escapeHtml(sc)}</li>`).join('')}
+                            </ul>
+                        </div>
+                    </div>
+                </div>
+                `;
+                }).join('')}
+            </div>
+        </details>
+        ${rec.agenticPrompt?.structuralDecisions ? `
+        <details style="margin-bottom: 15px;">
+            <summary style="cursor: pointer; font-weight: bold; color: #FF9800;">🏗️ View Structural Decisions</summary>
+            <div style="margin-top: 10px; padding: 10px; background: var(--vscode-editor-background); border-radius: 5px;">
+                <p><strong>Framework:</strong> ${escapeHtml(rec.agenticPrompt.structuralDecisions.recommendedStructure)}</p>
+                <p><strong>Format Style:</strong> ${escapeHtml(rec.agenticPrompt.structuralDecisions.formatStyle)}</p>
+                <p><strong>Rationale:</strong> ${escapeHtml(rec.agenticPrompt.structuralDecisions.rationale)}</p>
+                <div style="margin-top: 10px;">
+                    <strong>Sections:</strong>
+                    <ul style="margin: 5px 0; padding-left: 20px;">
+                        ${rec.agenticPrompt.structuralDecisions.sections.map(s => `<li>${escapeHtml(s)}</li>`).join('')}
+                    </ul>
+                </div>
+            </div>
+        </details>
+        ` : ''}
+        <details style="margin-bottom: 15px;">
+            <summary style="cursor: pointer; font-weight: bold; color: #2196F3;">🧠 View Reasoning</summary>
+            <div style="margin-top: 10px; padding: 10px; background: var(--vscode-editor-background); border-radius: 5px; white-space: pre-wrap; font-size: 0.9em;">
+                ${escapeHtml(rec.agenticPrompt.reasoning)}
+            </div>
+        </details>
+        ` : ''}
+        ${rec.agenticPrompt?.mlGenerated ? `
+        <div style="background: #2196F3; color: white; padding: 15px; border-radius: 5px; margin-bottom: 15px;">
+            <h3 style="margin-top: 0;">🤖 ML-Generated Ideal Prompt</h3>
+            <p style="margin: 5px 0;">Generated using learned patterns to follow all prompt engineering rules</p>
+            <p style="margin: 5px 0;"><strong>Confidence:</strong> ${rec.agenticPrompt.mlGenerated.confidence}%</p>
+            <p style="margin: 5px 0;"><strong>Rules Followed:</strong> ${rec.agenticPrompt.mlGenerated.rulesFollowed.length}</p>
+            <p style="margin: 5px 0;"><strong>Patterns Applied:</strong> ${rec.agenticPrompt.mlGenerated.patternsApplied.length}</p>
+        </div>
+        <details style="margin-bottom: 15px;">
+            <summary style="cursor: pointer; font-weight: bold; color: #2196F3;">🔍 View ML Patterns Applied</summary>
+            <div style="margin-top: 10px; padding: 10px; background: var(--vscode-editor-background); border-radius: 5px;">
+                ${rec.agenticPrompt.mlGenerated.patternsApplied.map(pattern => `
+                    <div style="margin-bottom: 10px; padding: 10px; border-left: 3px solid #2196F3;">
+                        <strong>${escapeHtml(pattern.pattern)}</strong>
+                        <p style="margin: 5px 0; color: #666; font-size: 0.9em;">Context: ${escapeHtml(pattern.context)}</p>
+                        <p style="margin: 5px 0; color: #666; font-size: 0.9em;">Application: ${escapeHtml(pattern.application)}</p>
+                        <p style="margin: 5px 0; color: #666; font-size: 0.9em;">Confidence: ${(pattern.confidence * 100).toFixed(0)}%</p>
+                    </div>
+                `).join('')}
+            </div>
+        </details>
+        <details style="margin-bottom: 15px;">
+            <summary style="cursor: pointer; font-weight: bold; color: #4CAF50;">✓ Rules Followed</summary>
+            <div style="margin-top: 10px; padding: 10px; background: var(--vscode-editor-background); border-radius: 5px;">
+                <ul style="margin: 5px 0; padding-left: 20px;">
+                    ${rec.agenticPrompt.mlGenerated.rulesFollowed.map(rule => `<li>✓ ${escapeHtml(rule)}</li>`).join('')}
+                </ul>
+            </div>
+        </details>
+        <p style="font-weight: bold; color: #4CAF50; margin-bottom: 10px;">✨ Ideal Prompt (ML-Generated Following Rules):</p>
+        <div class="filled-prompt" style="white-space: pre-wrap; font-family: monospace; background: var(--vscode-textCodeBlock-background); padding: 15px; border-radius: 5px; border: 2px solid #4CAF50;">${escapeHtml(rec.agenticPrompt.mlGenerated.prompt)}</div>
+        ` : `
+        <p>The agentic system has intelligently filled in details and generated an optimized prompt:</p>
+        <div class="filled-prompt" style="white-space: pre-wrap; font-family: monospace; background: var(--vscode-textCodeBlock-background); padding: 15px; border-radius: 5px; border: 1px solid var(--vscode-panel-border);">${escapeHtml(rec.filledPrompt)}</div>
+        `}
+        <button class="btn btn-primary" onclick="copyPrompt()" style="margin-top: 10px;">📋 Copy Ideal Prompt</button>
+        ${rec.agenticPrompt && (rec.agenticPrompt.improvements.some(imp => imp.includes('filled in')) || rec.missingElements.length > 0) ? `
+        <div style="margin-top: 15px; padding: 10px; background: #FFF9C4; border-radius: 5px; border-left: 4px solid #FBC02D;">
+            <strong>💡 Note:</strong> The agentic system has made intelligent inferences to fill in details. If you need to adjust any part of the prompt, you can edit it after copying.
+            ${rec.missingElements.length > 0 ? `
+            <div style="margin-top: 10px;">
+                <strong>Additional details you may want to specify:</strong>
+                <ul style="margin: 5px 0; padding-left: 20px;">
+                    ${rec.missingElements.slice(0, 3).map(elm => `<li>${escapeHtml(elm)}</li>`).join('')}
+                </ul>
+            </div>
+            ` : ''}
+        </div>
+        ` : ''}
+        ${rec.agenticPrompt && rec.agenticPrompt.improvements.length > 0 ? `
+        <div style="margin-top: 15px; padding: 10px; background: #E3F2FD; border-radius: 5px;">
+            <strong>Key Improvements Made:</strong>
+            <ul style="margin: 5px 0; padding-left: 20px;">
+                ${rec.agenticPrompt.improvements.map(imp => `<li>${escapeHtml(imp)}</li>`).join('')}
+            </ul>
+        </div>
+        ` : ''}
+        ${rec.agenticPrompt && rec.agenticPrompt.structuralChanges && rec.agenticPrompt.structuralChanges.length > 0 ? `
+        <div style="margin-top: 15px; padding: 10px; background: #FFF3E0; border-radius: 5px;">
+            <strong>Structural Changes Applied:</strong>
+            <ul style="margin: 5px 0; padding-left: 20px;">
+                ${rec.agenticPrompt.structuralChanges.map(change => `<li>${escapeHtml(change)}</li>`).join('')}
+            </ul>
+        </div>
+        ` : ''}
     </div>
 
     <div class="section">
-        <h2>🔄 Iteration Strategy</h2>
+        <h2>🎯 Concrete Task Action Plan</h2>
+        ${rec.taskActionPlan.basedOnHistory ? `
+        <div style="background: #4CAF50; color: white; padding: 8px; border-radius: 4px; margin-bottom: 15px;">
+            📊 ${escapeHtml(rec.taskActionPlan.historyPattern || 'Based on chat history patterns')}
+        </div>
+        ` : ''}
+        <p><strong>Complexity:</strong> <span class="badge badge-${rec.taskActionPlan.complexity === 'simple' ? 'success' : rec.taskActionPlan.complexity === 'medium' ? 'info' : 'warning'}">${rec.taskActionPlan.complexity.toUpperCase()}</span></p>
+        ${rec.taskActionPlan.totalEstimatedTime ? `<p><strong>Estimated Time:</strong> ${escapeHtml(rec.taskActionPlan.totalEstimatedTime)}</p>` : ''}
+        
+        ${rec.taskActionPlan.prerequisites.length > 0 ? `
+        <div style="margin-bottom: 15px;">
+            <strong>Prerequisites:</strong>
+            <ul>
+                ${rec.taskActionPlan.prerequisites.map(prereq => `<li>${escapeHtml(prereq)}</li>`).join('')}
+            </ul>
+        </div>
+        ` : ''}
+        
+        <h3>Action Steps:</h3>
+        <ol style="list-style: none; padding-left: 0;">
+            ${rec.taskActionPlan.steps.map(step => `
+            <li style="margin-bottom: 20px; padding: 15px; background: var(--vscode-editor-background); border-radius: 5px; border-left: 4px solid #2196F3;">
+                <div style="font-weight: bold; color: #2196F3; margin-bottom: 5px;">
+                    Step ${step.stepNumber}: ${escapeHtml(step.action)}
+                </div>
+                <div style="margin-bottom: 8px; color: var(--vscode-foreground);">
+                    ${escapeHtml(step.description)}
+                </div>
+                <div style="font-size: 0.9em; color: #666; margin-bottom: 5px;">
+                    <strong>Why:</strong> ${escapeHtml(step.why)}
+                </div>
+                ${step.estimatedTime ? `<div style="font-size: 0.9em; color: #666; margin-bottom: 5px;"><strong>Time:</strong> ${escapeHtml(step.estimatedTime)}</div>` : ''}
+                ${step.dependencies && step.dependencies.length > 0 ? `
+                <div style="font-size: 0.9em; color: #FF9800; margin-bottom: 5px;">
+                    <strong>Dependencies:</strong> ${step.dependencies.map(d => escapeHtml(d)).join(', ')}
+                </div>
+                ` : ''}
+                ${step.requiredContext && step.requiredContext.length > 0 ? `
+                <div style="font-size: 0.9em; color: #9C27B0; margin-bottom: 5px;">
+                    <strong>Required Context:</strong> ${step.requiredContext.map(c => escapeHtml(c)).join(', ')}
+                </div>
+                ` : ''}
+            </li>
+            `).join('')}
+        </ol>
+    </div>
+
+    <div class="section">
+        <h2>🔄 Iteration Strategy (Prompt Refinement)</h2>
         <p><strong>Expected Iterations:</strong> ${rec.iterationStrategy.expectedIterations}</p>
         <h3>Steps:</h3>
         ${rec.iterationStrategy.steps.map((step, i) => `
@@ -760,7 +934,8 @@ function generateMLRecommendationsHTML(rec: MLRecommendations, original: string,
         const vscode = acquireVsCodeApi();
         
         function copyPrompt() {
-            const prompt = \`${escapeHtml(rec.filledPrompt)}\`;
+            // Use ML-generated ideal prompt if available, otherwise use filled prompt
+            const prompt = \`${escapeHtml(rec.agenticPrompt?.mlGenerated?.prompt || rec.filledPrompt)}\`;
             vscode.postMessage({
                 command: 'copyPrompt',
                 text: prompt

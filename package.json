@@ -134,6 +134,8 @@
     "@types/node": "16.x",
     "typescript": "^4.9.4"
   },
-  "dependencies": {}
+  "dependencies": {
+    "@xenova/transformers": "^2.17.2"
+  }
 }
 

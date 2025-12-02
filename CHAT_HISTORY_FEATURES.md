@@ -150,3 +150,5 @@ Potential improvements:
 - Export/import history
 - Advanced pattern recognition
 
+
+
