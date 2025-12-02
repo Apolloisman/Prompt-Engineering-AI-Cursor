@@ -5,6 +5,8 @@
 
 import { pipeline } from '@xenova/transformers';
 import { PromptAnalysis } from './promptAnalyzer';
+import { PromptDecomposer, TaskBreakdown, DecomposedCriterion } from './promptDecomposer';
+import { PromptEnhancer } from './promptEnhancer';
 
 export interface PromptRule {
     rule: string;
@@ -26,6 +28,7 @@ export interface IdealPrompt {
     rulesFollowed: string[];
     patternsApplied: LearnedPattern[];
     confidence: number;
+    taskBreakdown?: TaskBreakdown; // ML decomposition with success criteria breakdown
 }
 
 export class PromptMLGenerator {
@@ -33,6 +36,8 @@ export class PromptMLGenerator {
     private generator: any = null;
     private isInitialized: boolean = false;
     private initializationPromise: Promise<void> | null = null;
+    private decomposer: PromptDecomposer;
+    private enhancer: PromptEnhancer;
     
     // Core prompt engineering rules
     private promptRules: PromptRule[] = [
@@ -91,6 +96,8 @@ export class PromptMLGenerator {
 
     constructor() {
         this.initializePatterns();
+        this.decomposer = new PromptDecomposer();
+        this.enhancer = new PromptEnhancer();
     }
 
     private initializePatterns() {
@@ -200,7 +207,8 @@ export class PromptMLGenerator {
         originalPrompt: string,
         analysis: PromptAnalysis,
         goal: string,
-        context?: any
+        context?: any,
+        successCriteria?: string[]
     ): Promise<IdealPrompt> {
         await this.initialize();
 
@@ -221,7 +229,8 @@ export class PromptMLGenerator {
             detectedPatterns,
             analysis,
             goal,
-            context
+            context,
+            successCriteria
         );
 
         // Verify which rules were followed
@@ -230,11 +239,14 @@ export class PromptMLGenerator {
         // Calculate confidence based on rule adherence and pattern quality
         const confidence = this.calculateConfidence(rulesFollowed, applicableRules, learnedPatterns);
 
+        // Don't add verbose breakdown - keep prompt clean and concise
+        // The breakdown is available in the UI but not in the copyable prompt
         return {
             prompt: idealPrompt,
             rulesFollowed,
             patternsApplied: learnedPatterns,
-            confidence
+            confidence,
+            taskBreakdown: undefined // Available in UI but not cluttering the prompt
         };
     }
 
@@ -367,81 +379,44 @@ export class PromptMLGenerator {
         detectedPatterns: Map<string, number>,
         analysis: PromptAnalysis,
         goal: string,
-        context?: any
+        context?: any,
+        successCriteria?: string[]
     ): Promise<string> {
         let prompt = '';
 
-        // Rule 1: Define clear role (required)
+        // Generate clean, concise prompt - ML does the work, not instructions
+        
+        // Rule 1: Role (only if needed for context)
         const roleRule = rules.find(r => r.rule.includes('role'));
-        if (roleRule) {
+        if (roleRule && (goal === 'code_review' || goal === 'explanation')) {
             const role = this.determineRole(goal, detectedPatterns);
             prompt += `You are a ${role}.\n\n`;
         }
 
-        // Rule 2: Provide clear context (required)
+        // Rule 2: Context (only if meaningful)
         const contextRule = rules.find(r => r.category === 'context');
         if (contextRule) {
             const contextText = this.generateContext(originalPrompt, detectedPatterns, context);
-            if (contextText) {
+            if (contextText && contextText.length > 0) {
                 prompt += `Context: ${contextText}\n\n`;
             }
         }
 
-        // Rule 3: Be specific and concrete (required)
-        const concretenessRule = rules.find(r => r.category === 'concreteness');
-        if (concretenessRule) {
-            // Use learned patterns to make it concrete
-            const concreteTask = this.makeConcreteUsingPatterns(
-                originalPrompt,
-                learnedPatterns,
-                detectedPatterns,
-                goal
-            );
-            prompt += `Task: ${concreteTask}\n\n`;
-        }
+        // Rule 3: Task - ML generates ideal prompt (the actual prompt to use)
+        const idealTask = await this.analyzeAndImprovePrompt(
+            originalPrompt,
+            learnedPatterns,
+            detectedPatterns,
+            goal,
+            analysis,
+            context
+        );
+        
+        // The ideal task IS the prompt - it's the solved/upgraded version
+        // Don't add steps here - the ideal prompt should be complete and ready to use
+        prompt += `${idealTask}`;
 
-        // Rule 4: Use structured format (required)
-        const structureRule = rules.find(r => r.category === 'structure');
-        if (structureRule) {
-            const structuredSteps = this.generateStructuredStepsUsingPatterns(
-                originalPrompt,
-                learnedPatterns,
-                detectedPatterns,
-                goal
-            );
-            if (structuredSteps) {
-                prompt += `${structuredSteps}\n\n`;
-            }
-        }
-
-        // Rule 5: Include execution actions (required)
-        // Already handled in structured steps, but ensure execution language
-        prompt = this.ensureExecutionLanguage(prompt, learnedPatterns);
-
-        // Rule 6: Specify output format (required)
-        const formatRule = rules.find(r => r.category === 'format');
-        if (formatRule) {
-            const formatText = this.generateFormatSpecification(goal, detectedPatterns, learnedPatterns);
-            prompt += `Output Format: ${formatText}\n\n`;
-        }
-
-        // Optional rules
-        const verificationRule = rules.find(r => r.rule.includes('verification'));
-        if (verificationRule) {
-            const verification = this.generateVerificationUsingPatterns(goal, learnedPatterns, detectedPatterns);
-            if (verification) {
-                prompt += `${verification}\n\n`;
-            }
-        }
-
-        const examplesRule = rules.find(r => r.category === 'examples');
-        if (examplesRule && analysis.score < 60) {
-            const exampleText = this.generateExampleUsingPatterns(goal, learnedPatterns);
-            if (exampleText) {
-                prompt += `Example: ${exampleText}\n\n`;
-            }
-        }
-
+        // Return the ideal prompt - this is what gets copied
         return prompt.trim();
     }
 
@@ -499,91 +474,307 @@ export class PromptMLGenerator {
     }
 
     /**
-     * Make prompt concrete using learned patterns
+     * Analyze and improve prompt - ML actually does the work, not just instructions
      */
-    private makeConcreteUsingPatterns(
-        prompt: string,
+    private async analyzeAndImprovePrompt(
+        originalPrompt: string,
         learnedPatterns: LearnedPattern[],
         patterns: Map<string, number>,
-        goal: string
-    ): string {
-        let concrete = prompt;
+        goal: string,
+        analysis: PromptAnalysis,
+        context?: any
+    ): Promise<string> {
+        // Use the enhancer to actually analyze and improve the prompt
+        const enhanced = await this.enhancer.analyzeAndImprovePrompt(
+            originalPrompt,
+            goal,
+            patterns,
+            analysis,
+            context
+        );
 
-        // If prompt is vague, use learned patterns to enhance it
-        if (prompt.length < 50 || patterns.has('vague')) {
-            // Apply learned patterns for concreteness
-            const concretenessPatterns = learnedPatterns.filter(p => 
-                p.ruleCategory === 'concreteness'
-            );
-
-            if (concretenessPatterns.length > 0) {
-                // Use the highest confidence pattern
-                const bestPattern = concretenessPatterns.sort((a, b) => 
-                    b.confidence - a.confidence
-                )[0];
-
-                // Apply the pattern's application
-                if (bestPattern.application.includes('Add:')) {
-                    const additions = bestPattern.application.split('Add:')[1].trim();
-                    concrete = `${prompt}. ${additions}`;
-                } else {
-                    concrete = `${prompt}. ${bestPattern.application}`;
-                }
-            } else {
-                // Generic enhancement
-                concrete = `${prompt}. Provide a complete, production-ready solution with best practices.`;
-            }
-        }
-
-        // Apply domain-specific patterns
-        if (patterns.has('api')) {
-            const apiPatterns = learnedPatterns.filter(p => 
-                p.context.includes('API') || p.context.includes('api')
-            );
-            if (apiPatterns.length > 0) {
-                apiPatterns.forEach(p => {
-                    if (!concrete.toLowerCase().includes(p.pattern.toLowerCase())) {
-                        concrete += ` ${p.application}`;
-                    }
-                });
-            }
-        }
-
-        return concrete;
+        return enhanced;
     }
 
     /**
-     * Generate structured steps using learned patterns
+     * Generate specific execution steps - ML analyzes and creates actual steps
      */
-    private generateStructuredStepsUsingPatterns(
+    private async generateSpecificExecutionSteps(
         prompt: string,
         learnedPatterns: LearnedPattern[],
         patterns: Map<string, number>,
-        goal: string
-    ): string {
-        // Get structure patterns
-        const structurePatterns = learnedPatterns.filter(p => 
-            p.ruleCategory === 'structure'
+        goal: string,
+        successCriteria?: string[],
+        context?: any,
+        analysis?: PromptAnalysis
+    ): Promise<string> {
+        // ML analyzes the prompt and generates actual specific steps (not instructions to create steps)
+        const specificSteps = this.enhancer.generateSpecificSteps(
+            prompt,
+            goal,
+            patterns,
+            successCriteria,
+            context
         );
 
-        if (structurePatterns.length === 0) {
-            return 'Execute this task step-by-step:\n\n1. Understand requirements\n2. Plan approach\n3. Implement solution\n4. Verify results';
+        return specificSteps;
+    }
+
+    /**
+     * Generate detailed execution steps using ML from prompt, patterns, and success criteria
+     */
+    private generateDetailedStepsFromML(
+        prompt: string,
+        goal: string,
+        patterns: Map<string, number>,
+        structurePatterns: LearnedPattern[],
+        successCriteria?: string[],
+        context?: any
+    ): Array<{ action: string; subActions: string[]; successCheck: string }> {
+        const steps: Array<{ action: string; subActions: string[]; successCheck: string }> = [];
+        const lower = prompt.toLowerCase();
+
+        // Use ML to determine steps based on goal and patterns
+        switch (goal) {
+            case 'code_generation':
+                steps.push({
+                    action: 'Analyze requirements and identify what needs to be created',
+                    subActions: [
+                        'Identify the specific functionality to implement',
+                        'Determine inputs, outputs, and data structures needed',
+                        'Identify constraints, edge cases, and error scenarios',
+                        'Clarify any ambiguities in the requirements'
+                    ],
+                    successCheck: successCriteria?.find(c => c.toLowerCase().includes('requirement') || c.toLowerCase().includes('define')) || 'All requirements are clearly understood and documented'
+                });
+                steps.push({
+                    action: 'Design the solution architecture and structure',
+                    subActions: [
+                        'Plan data structures and their relationships',
+                        'Design function/class structure and interfaces',
+                        'Define component relationships and dependencies',
+                        'Consider scalability, maintainability, and best practices'
+                    ],
+                    successCheck: successCriteria?.find(c => c.toLowerCase().includes('architecture') || c.toLowerCase().includes('design')) || 'Architecture is clearly defined with components and relationships'
+                });
+                steps.push({
+                    action: 'Implement core functionality',
+                    subActions: [
+                        'Write the main logic and algorithms',
+                        'Implement data structures and classes',
+                        'Handle basic use cases and primary functionality',
+                        'Ensure code compiles and runs without errors'
+                    ],
+                    successCheck: successCriteria?.find(c => c.toLowerCase().includes('implement') || c.toLowerCase().includes('code')) || 'Core functionality is implemented and working'
+                });
+                steps.push({
+                    action: 'Add robustness and error handling',
+                    subActions: [
+                        'Implement error handling for edge cases',
+                        'Add input validation and data sanitization',
+                        'Handle exceptions and error scenarios gracefully',
+                        'Add logging and debugging support'
+                    ],
+                    successCheck: successCriteria?.find(c => c.toLowerCase().includes('error') || c.toLowerCase().includes('robust')) || 'Error handling is comprehensive and tested'
+                });
+                steps.push({
+                    action: 'Test and verify the implementation',
+                    subActions: [
+                        'Test with normal inputs and expected scenarios',
+                        'Test edge cases and boundary conditions',
+                        'Verify error handling works correctly',
+                        'Validate output matches requirements'
+                    ],
+                    successCheck: successCriteria?.find(c => c.toLowerCase().includes('test') || c.toLowerCase().includes('verify')) || 'All tests pass and requirements are met'
+                });
+                break;
+
+            case 'debugging':
+                steps.push({
+                    action: 'Reproduce and isolate the issue',
+                    subActions: [
+                        'Reproduce the error consistently',
+                        'Identify the specific conditions that trigger the issue',
+                        'Isolate the problematic code section',
+                        'Gather error messages, logs, and relevant context'
+                    ],
+                    successCheck: successCriteria?.find(c => c.toLowerCase().includes('reproduce') || c.toLowerCase().includes('isolate')) || 'Issue is consistently reproducible and isolated'
+                });
+                steps.push({
+                    action: 'Analyze root cause',
+                    subActions: [
+                        'Examine the code logic and data flow',
+                        'Check for logical errors, race conditions, or edge cases',
+                        'Review related code and dependencies',
+                        'Identify the underlying cause, not just symptoms'
+                    ],
+                    successCheck: successCriteria?.find(c => c.toLowerCase().includes('root') || c.toLowerCase().includes('cause')) || 'Root cause is identified and understood'
+                });
+                steps.push({
+                    action: 'Implement the fix',
+                    subActions: [
+                        'Apply the fix to address the root cause',
+                        'Ensure the fix doesn\'t break existing functionality',
+                        'Follow coding best practices and maintain code quality',
+                        'Add comments explaining the fix if needed'
+                    ],
+                    successCheck: successCriteria?.find(c => c.toLowerCase().includes('fix') || c.toLowerCase().includes('implement')) || 'Fix is implemented correctly'
+                });
+                steps.push({
+                    action: 'Verify the fix resolves the issue',
+                    subActions: [
+                        'Test that the original issue is resolved',
+                        'Verify no new issues were introduced',
+                        'Test related functionality to ensure nothing broke',
+                        'Confirm the fix works in all relevant scenarios'
+                    ],
+                    successCheck: successCriteria?.find(c => c.toLowerCase().includes('verify') || c.toLowerCase().includes('resolve')) || 'Issue is resolved and verified'
+                });
+                break;
+
+            case 'refactoring':
+                steps.push({
+                    action: 'Analyze current code structure',
+                    subActions: [
+                        'Identify code smells and areas for improvement',
+                        'Understand current dependencies and relationships',
+                        'Document what needs to be refactored and why',
+                        'Plan the refactoring approach'
+                    ],
+                    successCheck: successCriteria?.find(c => c.toLowerCase().includes('analyze') || c.toLowerCase().includes('understand')) || 'Current code structure is fully understood'
+                });
+                steps.push({
+                    action: 'Design improved structure',
+                    subActions: [
+                        'Design new structure with better organization',
+                        'Plan how to split or reorganize code',
+                        'Define new interfaces and abstractions',
+                        'Ensure backward compatibility if needed'
+                    ],
+                    successCheck: successCriteria?.find(c => c.toLowerCase().includes('design') || c.toLowerCase().includes('structure')) || 'Improved structure is designed'
+                });
+                steps.push({
+                    action: 'Refactor incrementally',
+                    subActions: [
+                        'Make small, incremental changes',
+                        'Refactor one section at a time',
+                        'Maintain functionality throughout the process',
+                        'Run tests after each change'
+                    ],
+                    successCheck: successCriteria?.find(c => c.toLowerCase().includes('refactor') || c.toLowerCase().includes('incremental')) || 'Refactoring is completed incrementally'
+                });
+                steps.push({
+                    action: 'Verify refactored code',
+                    subActions: [
+                        'Run all existing tests to ensure nothing broke',
+                        'Verify code quality improvements',
+                        'Check that functionality is preserved',
+                        'Ensure code is more maintainable'
+                    ],
+                    successCheck: successCriteria?.find(c => c.toLowerCase().includes('verify') || c.toLowerCase().includes('test')) || 'Refactored code is verified and working'
+                });
+                break;
+
+            default:
+                // Generic steps based on patterns
+                if (structurePatterns.length > 0) {
+                    const bestPattern = structurePatterns.sort((a, b) => b.confidence - a.confidence)[0];
+                    const parsedSteps = this.parseStepsFromPattern(bestPattern.application);
+                    parsedSteps.forEach((step, index) => {
+                        steps.push({
+                            action: step,
+                            subActions: this.generateSubActionsForStep(step, goal, patterns),
+                            successCheck: successCriteria?.[index] || `Step ${index + 1} is completed successfully`
+                        });
+                    });
+                } else {
+                    // Fallback generic steps
+                    steps.push(
+                        {
+                            action: 'Understand requirements and context',
+                            subActions: ['Analyze the task', 'Identify key requirements', 'Gather necessary information'],
+                            successCheck: 'Requirements are clearly understood'
+                        },
+                        {
+                            action: 'Plan the approach',
+                            subActions: ['Determine the best approach', 'Break down into sub-tasks', 'Identify dependencies'],
+                            successCheck: 'Approach is planned'
+                        },
+                        {
+                            action: 'Execute the solution',
+                            subActions: ['Implement the planned approach', 'Follow best practices', 'Handle edge cases'],
+                            successCheck: 'Solution is implemented'
+                        },
+                        {
+                            action: 'Verify and validate',
+                            subActions: ['Test the solution', 'Verify it meets requirements', 'Check for issues'],
+                            successCheck: 'Solution is verified and working'
+                        }
+                    );
+                }
         }
 
-        // Use the best structure pattern
-        const bestPattern = structurePatterns.sort((a, b) => 
-            b.confidence - a.confidence
-        )[0];
+        // Enhance steps based on detected patterns
+        if (patterns.has('api')) {
+            steps.forEach(step => {
+                if (step.action.toLowerCase().includes('implement') || step.action.toLowerCase().includes('execute')) {
+                    step.subActions.push('Ensure RESTful conventions are followed');
+                    step.subActions.push('Implement proper HTTP status codes and error handling');
+                }
+            });
+        }
 
-        // Parse the application to extract steps
-        const steps = this.parseStepsFromPattern(bestPattern.application);
+        if (patterns.has('database')) {
+            steps.forEach(step => {
+                if (step.action.toLowerCase().includes('implement') || step.action.toLowerCase().includes('design')) {
+                    step.subActions.push('Design efficient database queries');
+                    step.subActions.push('Ensure data integrity and security');
+                }
+            });
+        }
 
-        let structured = 'Execute this task step-by-step:\n\n';
-        steps.forEach((step, index) => {
-            structured += `${index + 1}. ${step}\n`;
-        });
+        if (patterns.has('security')) {
+            steps.forEach(step => {
+                if (step.action.toLowerCase().includes('implement') || step.action.toLowerCase().includes('add')) {
+                    step.subActions.push('Implement security best practices');
+                    step.subActions.push('Add authentication and authorization checks');
+                }
+            });
+        }
 
-        return structured;
+        return steps;
+    }
+
+    /**
+     * Generate sub-actions for a step based on goal and patterns
+     */
+    private generateSubActionsForStep(
+        step: string,
+        goal: string,
+        patterns: Map<string, number>
+    ): string[] {
+        const subActions: string[] = [];
+        const lower = step.toLowerCase();
+
+        if (lower.includes('analyze') || lower.includes('understand')) {
+            subActions.push('Gather all relevant information');
+            subActions.push('Identify key requirements and constraints');
+            subActions.push('Document findings and decisions');
+        } else if (lower.includes('design') || lower.includes('plan')) {
+            subActions.push('Create a clear structure and approach');
+            subActions.push('Identify components and their relationships');
+            subActions.push('Plan for scalability and maintainability');
+        } else if (lower.includes('implement') || lower.includes('create') || lower.includes('build')) {
+            subActions.push('Write clean, well-structured code');
+            subActions.push('Follow best practices and coding standards');
+            subActions.push('Add proper error handling');
+        } else if (lower.includes('test') || lower.includes('verify')) {
+            subActions.push('Test with normal scenarios');
+            subActions.push('Test edge cases and error conditions');
+            subActions.push('Verify all requirements are met');
+        }
+
+        return subActions;
     }
 
     /**

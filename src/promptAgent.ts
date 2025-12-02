@@ -92,11 +92,19 @@ export class PromptAgent {
 
         // Step 5: Generate ideal prompt using ML-learned patterns to follow rules
         // ML learns patterns and uses them to create prompt following all rules
+        // Extract success criteria from all steps for ML generation
+        const allSuccessCriteria: string[] = [];
+        plan.stepGoals.forEach(step => {
+            const stepCriteria = aiDeterminedSuccessCriteria?.get(step.stepNumber) || step.successCriteria;
+            allSuccessCriteria.push(...stepCriteria);
+        });
+        
         const idealPromptResult = await this.mlGenerator.generateIdealPrompt(
             originalPrompt,
             analysis,
             plan.overallGoal,
-            chatHistory
+            chatHistory,
+            allSuccessCriteria
         );
         
         // Use the ML-generated ideal prompt (it follows rules using learned patterns)

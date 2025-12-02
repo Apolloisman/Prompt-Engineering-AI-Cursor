@@ -9,12 +9,23 @@ export interface ChatMessage {
     modelUsed?: string;
 }
 
+export interface AttachedReference {
+    id: string;
+    name: string;
+    summary: string;
+    content: string;
+    source?: string;
+    addedAt: number;
+    size: number;
+}
+
 export interface ChatHistory {
     messages: ChatMessage[];
     sessionStart: number;
     detectedPatterns: string[];
     commonReferences: Map<string, number>;
     commonContext: Map<string, number>;
+    attachedReferences: AttachedReference[];
 }
 
 export interface ChatHistoryContext {
@@ -24,11 +35,15 @@ export interface ChatHistoryContext {
     alreadyProvidedContext: string[];
     commonReferences: string[];
     sessionDuration: number;
+    attachedReferences: AttachedReference[];
+    referenceSummaries: string[];
 }
 
 export class ChatHistoryManager {
     private history: ChatHistory;
     private maxHistorySize: number = 50;
+    private maxReferences: number = 12;
+    private maxReferenceChars: number = 120000; // ~120k chars (~80k tokens)
     private storageKey: string = 'promptAssistant.chatHistory';
 
     constructor(private context: vscode.ExtensionContext) {
@@ -162,7 +177,8 @@ export class ChatHistoryManager {
             sessionStart: Date.now(),
             detectedPatterns: [],
             commonReferences: new Map(),
-            commonContext: new Map()
+            commonContext: new Map(),
+            attachedReferences: []
         };
         this.saveHistory();
     }
@@ -204,8 +220,12 @@ export class ChatHistoryManager {
                     sessionStart: Date.now(),
                     detectedPatterns: [],
                     commonReferences: new Map(),
-                    commonContext: new Map()
+                    commonContext: new Map(),
+                    attachedReferences: []
                 };
+            }
+            if (!stored.attachedReferences) {
+                stored.attachedReferences = [];
             }
             return stored;
         }
@@ -215,7 +235,8 @@ export class ChatHistoryManager {
             sessionStart: Date.now(),
             detectedPatterns: [],
             commonReferences: new Map(),
-            commonContext: new Map()
+            commonContext: new Map(),
+            attachedReferences: []
         };
     }
 
@@ -270,8 +291,80 @@ export class ChatHistoryManager {
             alreadyMentionedReferences: this.getReferencesAlreadyMentioned(),
             alreadyProvidedContext: this.getContextAlreadyProvided(),
             commonReferences: this.getCommonReferences(),
-            sessionDuration: this.getSessionDuration()
+            sessionDuration: this.getSessionDuration(),
+            attachedReferences: this.getAttachedReferences(5),
+            referenceSummaries: this.getAttachedReferences(5).map(ref => `${ref.name}: ${ref.summary}`)
         };
+    }
+
+    getAttachedReferences(limit: number = 5): AttachedReference[] {
+        if (!this.history.attachedReferences || this.history.attachedReferences.length === 0) {
+            return [];
+        }
+        return this.history.attachedReferences.slice(-limit);
+    }
+
+    listAllReferences(): AttachedReference[] {
+        return this.history.attachedReferences || [];
+    }
+
+    attachReference(name: string, content: string, source?: string): AttachedReference | null {
+        const trimmed = (content || '').trim();
+        if (!trimmed) {
+            return null;
+        }
+
+        const normalized = trimmed.length > this.maxReferenceChars
+            ? `${trimmed.slice(0, this.maxReferenceChars)}\n\n...[truncated]`
+            : trimmed;
+
+        const reference: AttachedReference = {
+            id: `${Date.now().toString(36)}-${Math.random().toString(36).slice(2, 8)}`,
+            name: name || `Reference ${this.history.attachedReferences.length + 1}`,
+            summary: this.createReferenceSummary(normalized),
+            content: normalized,
+            source,
+            addedAt: Date.now(),
+            size: normalized.length
+        };
+
+        if (!this.history.attachedReferences) {
+            this.history.attachedReferences = [];
+        }
+
+        this.history.attachedReferences.push(reference);
+
+        if (this.history.attachedReferences.length > this.maxReferences) {
+            this.history.attachedReferences = this.history.attachedReferences.slice(-this.maxReferences);
+        }
+
+        this.saveHistory();
+        return reference;
+    }
+
+    clearReferences(): void {
+        this.history.attachedReferences = [];
+        this.saveHistory();
+    }
+
+    private createReferenceSummary(content: string): string {
+        const cleaned = content.replace(/\s+/g, ' ').trim();
+        if (!cleaned) {
+            return 'Reference provided with no readable content.';
+        }
+
+        const sentences = cleaned.split(/(?<=[.!?])\s+/).slice(0, 3);
+        let summary = sentences.join(' ');
+        if (summary.length > 500) {
+            summary = `${summary.slice(0, 500)}...`;
+        }
+
+        const keyBullets = content.split('\n').filter(line => line.trim().startsWith('-') || line.trim().startsWith('*')).slice(0, 2);
+        if (keyBullets.length > 0) {
+            summary += ` Highlights: ${keyBullets.map(b => b.replace(/^[\-\*\s]+/, '').trim()).join(' | ')}`;
+        }
+
+        return summary;
     }
 }
 

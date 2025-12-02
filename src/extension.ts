@@ -1,4 +1,6 @@
 import * as vscode from 'vscode';
+import { promises as fs } from 'fs';
+import * as path from 'path';
 import { PromptAnalyzer, PromptAnalysis } from './promptAnalyzer';
 import { PromptTemplates } from './promptTemplates';
 import { GuideViewer } from './guideViewer';
@@ -133,6 +135,90 @@ export function activate(context: vscode.ExtensionContext) {
         }
     );
 
+    const attachReferenceCommand = vscode.commands.registerCommand(
+        'promptAssistant.attachReference',
+        async () => {
+            const action = await vscode.window.showQuickPick([
+                { label: 'Attach file(s)', description: 'Select one or more local files', value: 'files' },
+                { label: 'Attach clipboard text', description: 'Use current clipboard contents', value: 'clipboard' },
+                { label: 'Clear attached references', description: 'Remove all stored references', value: 'clear' }
+            ], {
+                placeHolder: 'How would you like to attach references for the prompt assistant?'
+            });
+
+            if (!action) {
+                return;
+            }
+
+            if (action.value === 'clear') {
+                const confirm = await vscode.window.showWarningMessage(
+                    'Clear all attached references?',
+                    { modal: true },
+                    'Clear'
+                );
+                if (confirm === 'Clear') {
+                    chatHistory.clearReferences();
+                    vscode.window.showInformationMessage('All attached references cleared.');
+                }
+                return;
+            }
+
+            if (action.value === 'files') {
+                const files = await vscode.window.showOpenDialog({
+                    canSelectMany: true,
+                    openLabel: 'Attach References'
+                });
+
+                if (!files || files.length === 0) {
+                    return;
+                }
+
+                const attached: string[] = [];
+                for (const file of files) {
+                    try {
+                        const content = await fs.readFile(file.fsPath, 'utf8');
+                        const name = path.basename(file.fsPath);
+                        const reference = chatHistory.attachReference(name, content, file.fsPath);
+                        if (reference) {
+                            attached.push(reference.name);
+                        }
+                    } catch (error: any) {
+                        vscode.window.showErrorMessage(`Failed to attach ${file.fsPath}: ${error.message || error}`);
+                    }
+                }
+
+                if (attached.length > 0) {
+                    vscode.window.showInformationMessage(`Attached ${attached.length} reference(s): ${attached.join(', ')}`);
+                } else {
+                    vscode.window.showWarningMessage('No references were attached.');
+                }
+
+                return;
+            }
+
+            if (action.value === 'clipboard') {
+                const clipboardText = await vscode.env.clipboard.readText();
+                if (!clipboardText.trim()) {
+                    vscode.window.showWarningMessage('Clipboard is empty.');
+                    return;
+                }
+
+                const name = await vscode.window.showInputBox({
+                    prompt: 'Name for this reference',
+                    placeHolder: 'e.g. Internal Design Spec',
+                    value: 'Clipboard Reference'
+                });
+
+                const reference = chatHistory.attachReference(name || 'Clipboard Reference', clipboardText);
+                if (reference) {
+                    vscode.window.showInformationMessage(`Attached reference "${reference.name}".`);
+                } else {
+                    vscode.window.showWarningMessage('Unable to attach reference from clipboard.');
+                }
+            }
+        }
+    );
+
     // Command: Insert template
     const templateCommand = vscode.commands.registerCommand(
         'promptAssistant.insertTemplate',
@@ -234,7 +320,7 @@ export function activate(context: vscode.ExtensionContext) {
     statusBarItem.show();
     context.subscriptions.push(statusBarItem);
 
-    context.subscriptions.push(suggestCommand, analyzeCommand, guideCommand, templateCommand, clipboardCommand, mlRecommendCommand);
+    context.subscriptions.push(suggestCommand, analyzeCommand, guideCommand, templateCommand, clipboardCommand, mlRecommendCommand, attachReferenceCommand);
 
     // Auto-suggest on typing (if enabled)
     const config = vscode.workspace.getConfiguration('promptAssistant');
@@ -609,6 +695,20 @@ function generateMLRecommendationsHTML(rec: MLRecommendations, original: string,
                 ${lang.cons.length > 0 ? `
                 <p><strong>Cons:</strong> ${lang.cons.join(', ')}</p>
                 ` : ''}
+            </div>
+        `).join('')}
+    </div>
+    ` : ''}
+
+    ${chatHistory?.attachedReferences && chatHistory.attachedReferences.length > 0 ? `
+    <div class="section">
+        <h2>📎 Attached References from Chat</h2>
+        <p>The following references are currently available to ground the prompt:</p>
+        ${chatHistory.attachedReferences.slice(-5).map((ref: any) => `
+            <div class="context-item">
+                <strong>${escapeHtml(ref.name)}</strong>
+                <p>${escapeHtml(ref.summary)}</p>
+                ${ref.source ? `<small>Source: ${escapeHtml(ref.source)}</small>` : ''}
             </div>
         `).join('')}
     </div>
