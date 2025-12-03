@@ -1,0 +1,1078 @@
+import * as vscode from 'vscode';
+import { promises as fs } from 'fs';
+import * as path from 'path';
+import { PromptAnalyzer, PromptAnalysis } from './promptAnalyzer';
+import { PromptTemplates } from './promptTemplates';
+import { GuideViewer } from './guideViewer';
+import { MLAdvisor, MLRecommendations } from './mlAdvisor';
+import { ChatHistoryManager } from './chatHistoryManager';
+
+export function activate(context: vscode.ExtensionContext) {
+    const analyzer = new PromptAnalyzer();
+    const templates = new PromptTemplates();
+    const guideViewer = new GuideViewer(context);
+    const mlAdvisor = new MLAdvisor();
+    const chatHistory = new ChatHistoryManager(context);
+
+    // Command: Suggest improved prompt
+    const suggestCommand = vscode.commands.registerCommand(
+        'promptAssistant.suggestPrompt',
+        async () => {
+            const editor = vscode.window.activeTextEditor;
+            if (!editor) {
+                vscode.window.showWarningMessage('No active editor');
+                return;
+            }
+
+            const selection = editor.document.getText(editor.selection);
+            if (!selection.trim()) {
+                vscode.window.showWarningMessage('Please select text to improve');
+                return;
+            }
+
+            const improved = analyzer.suggestImprovements(selection);
+            const framework = vscode.workspace.getConfiguration('promptAssistant').get<string>('preferredFramework', 'auto');
+            const structured = templates.applyFramework(improved, framework);
+
+            const result = await vscode.window.showInformationMessage(
+                'Improved prompt generated!',
+                'Insert',
+                'Show Analysis',
+                'Cancel'
+            );
+
+            if (result === 'Insert') {
+                editor.edit(editBuilder => {
+                    editBuilder.replace(editor.selection, structured);
+                });
+            } else if (result === 'Show Analysis') {
+                const analysis = analyzer.analyze(selection);
+                showAnalysisPanel(analysis, structured);
+            }
+        }
+    );
+
+    // Command: Analyze current prompt
+    const analyzeCommand = vscode.commands.registerCommand(
+        'promptAssistant.analyzePrompt',
+        async () => {
+            const editor = vscode.window.activeTextEditor;
+            if (!editor) {
+                vscode.window.showWarningMessage('No active editor');
+                return;
+            }
+
+            const selection = editor.document.getText(editor.selection);
+            if (!selection.trim()) {
+                vscode.window.showWarningMessage('Please select text to analyze');
+                return;
+            }
+
+            const analysis = analyzer.analyze(selection);
+            const improved = analyzer.suggestImprovements(selection);
+            const framework = vscode.workspace.getConfiguration('promptAssistant').get<string>('preferredFramework', 'auto');
+            const structured = templates.applyFramework(improved, framework);
+
+            showAnalysisPanel(analysis, structured);
+        }
+    );
+
+    // Command: Show guide
+    const guideCommand = vscode.commands.registerCommand(
+        'promptAssistant.showGuide',
+        () => {
+            guideViewer.show();
+        }
+    );
+
+    // Command: Get ML-powered recommendations
+    const mlRecommendCommand = vscode.commands.registerCommand(
+        'promptAssistant.getMLRecommendations',
+        async () => {
+            const editor = vscode.window.activeTextEditor;
+            let prompt = '';
+            
+            if (editor && !editor.selection.isEmpty) {
+                prompt = editor.document.getText(editor.selection);
+            } else {
+                // Try clipboard
+                prompt = await vscode.env.clipboard.readText();
+            }
+            
+            if (!prompt.trim()) {
+                const input = await vscode.window.showInputBox({
+                    placeHolder: 'Enter your prompt to get ML-powered recommendations...',
+                    prompt: 'ML Advisor will analyze and provide comprehensive recommendations'
+                });
+                if (!input) return;
+                prompt = input;
+            }
+            
+            vscode.window.withProgress({
+                location: vscode.ProgressLocation.Notification,
+                title: "Analyzing prompt with ML Advisor...",
+                cancellable: false
+            }, async (progress) => {
+                progress.report({ increment: 0 });
+                
+                // Get chat history context
+                const historyContext = chatHistory.getContextForAnalysis();
+                
+                // Analyze with history (now async due to ML model)
+                const recommendations = await mlAdvisor.analyzeAndRecommend(prompt, undefined, historyContext);
+                
+                // Add message to history with metadata
+                chatHistory.addMessage(prompt, {
+                    goal: recommendations.goal,
+                    referencesMentioned: recommendations.requiredReferences.map(r => r.type),
+                    contextProvided: recommendations.requiredContext.map(c => c.type)
+                });
+                
+                progress.report({ increment: 100 });
+                
+                await showMLRecommendationsPanel(recommendations, prompt, historyContext);
+            });
+        }
+    );
+
+    const attachReferenceCommand = vscode.commands.registerCommand(
+        'promptAssistant.attachReference',
+        async () => {
+            const action = await vscode.window.showQuickPick([
+                { label: 'Attach file(s)', description: 'Select one or more local files', value: 'files' },
+                { label: 'Attach clipboard text', description: 'Use current clipboard contents', value: 'clipboard' },
+                { label: 'Clear attached references', description: 'Remove all stored references', value: 'clear' }
+            ], {
+                placeHolder: 'How would you like to attach references for the prompt assistant?'
+            });
+
+            if (!action) {
+                return;
+            }
+
+            if (action.value === 'clear') {
+                const confirm = await vscode.window.showWarningMessage(
+                    'Clear all attached references?',
+                    { modal: true },
+                    'Clear'
+                );
+                if (confirm === 'Clear') {
+                    chatHistory.clearReferences();
+                    vscode.window.showInformationMessage('All attached references cleared.');
+                }
+                return;
+            }
+
+            if (action.value === 'files') {
+                const files = await vscode.window.showOpenDialog({
+                    canSelectMany: true,
+                    openLabel: 'Attach References'
+                });
+
+                if (!files || files.length === 0) {
+                    return;
+                }
+
+                const attached: string[] = [];
+                for (const file of files) {
+                    try {
+                        const content = await fs.readFile(file.fsPath, 'utf8');
+                        const name = path.basename(file.fsPath);
+                        const reference = chatHistory.attachReference(name, content, file.fsPath);
+                        if (reference) {
+                            attached.push(reference.name);
+                        }
+                    } catch (error: any) {
+                        vscode.window.showErrorMessage(`Failed to attach ${file.fsPath}: ${error.message || error}`);
+                    }
+                }
+
+                if (attached.length > 0) {
+                    vscode.window.showInformationMessage(`Attached ${attached.length} reference(s): ${attached.join(', ')}`);
+                } else {
+                    vscode.window.showWarningMessage('No references were attached.');
+                }
+
+                return;
+            }
+
+            if (action.value === 'clipboard') {
+                const clipboardText = await vscode.env.clipboard.readText();
+                if (!clipboardText.trim()) {
+                    vscode.window.showWarningMessage('Clipboard is empty.');
+                    return;
+                }
+
+                const name = await vscode.window.showInputBox({
+                    prompt: 'Name for this reference',
+                    placeHolder: 'e.g. Internal Design Spec',
+                    value: 'Clipboard Reference'
+                });
+
+                const reference = chatHistory.attachReference(name || 'Clipboard Reference', clipboardText);
+                if (reference) {
+                    vscode.window.showInformationMessage(`Attached reference "${reference.name}".`);
+                } else {
+                    vscode.window.showWarningMessage('Unable to attach reference from clipboard.');
+                }
+            }
+        }
+    );
+
+    // Command: Insert template
+    const templateCommand = vscode.commands.registerCommand(
+        'promptAssistant.insertTemplate',
+        async () => {
+            const templates = [
+                { label: 'Code Generation (RCTF)', template: 'code-generation-rctf' },
+                { label: 'Code Review', template: 'code-review' },
+                { label: 'Problem Solving (STAR)', template: 'problem-solving-star' },
+                { label: 'Explanation/Teaching', template: 'explanation' },
+                { label: 'Debugging', template: 'debugging' },
+                { label: 'Chain-of-Thought', template: 'chain-of-thought' }
+            ];
+
+            const selected = await vscode.window.showQuickPick(templates, {
+                placeHolder: 'Select a prompt template'
+            });
+
+            if (selected) {
+                const editor = vscode.window.activeTextEditor;
+                if (editor) {
+                    const template = PromptTemplates.getTemplate(selected.template);
+                    const position = editor.selection.active;
+                    editor.edit(editBuilder => {
+                        editBuilder.insert(position, template);
+                    });
+                }
+            }
+        }
+    );
+
+    // Command: Improve prompt from clipboard (for chat interface)
+    const clipboardCommand = vscode.commands.registerCommand(
+        'promptAssistant.improveClipboard',
+        async () => {
+            const clipboardText = await vscode.env.clipboard.readText();
+            if (!clipboardText.trim()) {
+                vscode.window.showWarningMessage('Clipboard is empty');
+                return;
+            }
+
+            // Offer ML recommendations by default
+            const choice = await vscode.window.showQuickPick([
+                { label: '🤖 Get ML-Powered Recommendations', description: 'Full analysis with model, parameters, context, and more', value: 'ml' },
+                { label: '✨ Quick Improve', description: 'Fast prompt improvement', value: 'quick' }
+            ], {
+                placeHolder: 'Choose improvement type'
+            });
+
+            if (!choice) return;
+
+            if (choice.value === 'ml') {
+                // Use ML advisor
+                vscode.window.withProgress({
+                    location: vscode.ProgressLocation.Notification,
+                    title: "Analyzing prompt with ML Advisor...",
+                    cancellable: false
+                }, async (progress) => {
+                    progress.report({ increment: 0 });
+                    const recommendations = await mlAdvisor.analyzeAndRecommend(clipboardText);
+                    progress.report({ increment: 100 });
+                    await showMLRecommendationsPanel(recommendations, clipboardText);
+                });
+            } else {
+                // Quick improve
+                const improved = analyzer.suggestImprovements(clipboardText);
+                const framework = vscode.workspace.getConfiguration('promptAssistant').get<string>('preferredFramework', 'auto');
+                const structured = templates.applyFramework(improved, framework);
+
+                const result = await vscode.window.showInformationMessage(
+                    'Improved prompt ready!',
+                    'Copy to Clipboard',
+                    'Show Analysis',
+                    'Open in Editor',
+                    'Cancel'
+                );
+
+                if (result === 'Copy to Clipboard') {
+                    await vscode.env.clipboard.writeText(structured);
+                    vscode.window.showInformationMessage('Improved prompt copied to clipboard! Paste it into Cursor chat.');
+                } else if (result === 'Show Analysis') {
+                    const analysis = analyzer.analyze(clipboardText);
+                    showAnalysisPanel(analysis, structured);
+                } else if (result === 'Open in Editor') {
+                    const doc = await vscode.workspace.openTextDocument({
+                        content: structured,
+                        language: 'plaintext'
+                    });
+                    await vscode.window.showTextDocument(doc);
+                }
+            }
+        }
+    );
+
+    // Status bar item for quick access
+    const statusBarItem = vscode.window.createStatusBarItem(vscode.StatusBarAlignment.Right, 100);
+    statusBarItem.command = 'promptAssistant.improveClipboard';
+    statusBarItem.text = '$(sparkle) Improve Prompt';
+    statusBarItem.tooltip = 'Improve prompt from clipboard (for Cursor chat)';
+    statusBarItem.show();
+    context.subscriptions.push(statusBarItem);
+
+    context.subscriptions.push(suggestCommand, analyzeCommand, guideCommand, templateCommand, clipboardCommand, mlRecommendCommand, attachReferenceCommand);
+
+    // Auto-suggest on typing (if enabled)
+    const config = vscode.workspace.getConfiguration('promptAssistant');
+    if (config.get<boolean>('autoSuggest', false)) {
+        setupAutoSuggest(context, analyzer, templates);
+    }
+}
+
+function showAnalysisPanel(analysis: PromptAnalysis, improvedPrompt: string) {
+    const panel = vscode.window.createWebviewPanel(
+        'promptAnalysis',
+        'Prompt Analysis',
+        vscode.ViewColumn.Beside,
+        { enableScripts: true }
+    );
+
+    const html = generateAnalysisHTML(analysis, improvedPrompt);
+    panel.webview.html = html;
+}
+
+function generateAnalysisHTML(analysis: PromptAnalysis, improvedPrompt: string): string {
+    const score = analysis.score;
+    const scoreColor = score >= 80 ? '#4CAF50' : score >= 60 ? '#FF9800' : '#F44336';
+    
+    return `<!DOCTYPE html>
+<html>
+<head>
+    <meta charset="UTF-8">
+    <style>
+        body { font-family: var(--vscode-font-family); padding: 20px; color: var(--vscode-foreground); }
+        .score { font-size: 48px; font-weight: bold; color: ${scoreColor}; }
+        .section { margin: 20px 0; }
+        .principle { margin: 10px 0; padding: 10px; background: var(--vscode-editor-background); border-left: 3px solid; }
+        .pass { border-color: #4CAF50; }
+        .fail { border-color: #F44336; }
+        .warning { border-color: #FF9800; }
+        .improved-prompt { background: var(--vscode-textCodeBlock-background); padding: 15px; border-radius: 5px; margin: 10px 0; }
+        .copy-btn { padding: 8px 16px; background: var(--vscode-button-background); color: var(--vscode-button-foreground); border: none; cursor: pointer; }
+        .copy-btn:hover { opacity: 0.8; }
+    </style>
+</head>
+<body>
+    <h1>Prompt Analysis</h1>
+    <div class="score">Score: ${score}/100</div>
+    
+    <div class="section">
+        <h2>Core Principles Check</h2>
+        ${analysis.principleChecks.map(p => `
+            <div class="principle ${p.status}">
+                <strong>${p.principle}</strong>: ${p.status === 'pass' ? '✓' : p.status === 'warning' ? '⚠' : '✗'}
+                <p>${p.feedback}</p>
+            </div>
+        `).join('')}
+    </div>
+
+    <div class="section">
+        <h2>Suggested Improvements</h2>
+        <ul>
+            ${analysis.suggestions.map(s => `<li>${s}</li>`).join('')}
+        </ul>
+    </div>
+
+    <div class="section">
+        <h2>Improved Prompt</h2>
+        <div class="improved-prompt">
+            <pre>${escapeHtml(improvedPrompt)}</pre>
+        </div>
+        <button class="copy-btn" onclick="copyToClipboard()">Copy Improved Prompt</button>
+    </div>
+
+    <script>
+        function copyToClipboard() {
+            const text = \`${escapeHtml(improvedPrompt)}\`;
+            navigator.clipboard.writeText(text).then(() => {
+                alert('Copied to clipboard!');
+            });
+        }
+    </script>
+</body>
+</html>`;
+}
+
+async function showMLRecommendationsPanel(recommendations: MLRecommendations, originalPrompt: string, chatHistory?: any) {
+    const panel = vscode.window.createWebviewPanel(
+        'mlRecommendations',
+        'ML-Powered Prompt Recommendations',
+        vscode.ViewColumn.Beside,
+        { enableScripts: true, retainContextWhenHidden: true }
+    );
+
+    const html = generateMLRecommendationsHTML(recommendations, originalPrompt, chatHistory);
+    panel.webview.html = html;
+
+    // Handle messages from webview
+    panel.webview.onDidReceiveMessage(
+        async message => {
+            switch (message.command) {
+                case 'copyPrompt':
+                    await vscode.env.clipboard.writeText(message.text);
+                    vscode.window.showInformationMessage('Prompt copied to clipboard!');
+                    break;
+                case 'copySettings':
+                    await vscode.env.clipboard.writeText(message.text);
+                    vscode.window.showInformationMessage('Settings copied to clipboard!');
+                    break;
+            }
+        },
+        undefined,
+        []
+    );
+}
+
+function generateMLRecommendationsHTML(rec: MLRecommendations, original: string, chatHistory?: any): string {
+    const confidenceColor = rec.confidence >= 80 ? '#4CAF50' : rec.confidence >= 60 ? '#FF9800' : '#F44336';
+    
+    return `<!DOCTYPE html>
+<html>
+<head>
+    <meta charset="UTF-8">
+    <style>
+        body { 
+            font-family: var(--vscode-font-family); 
+            padding: 20px; 
+            color: var(--vscode-foreground);
+            background: var(--vscode-editor-background);
+        }
+        .header { 
+            border-bottom: 2px solid var(--vscode-textLink-foreground);
+            padding-bottom: 10px;
+            margin-bottom: 20px;
+        }
+        .confidence { 
+            font-size: 24px; 
+            font-weight: bold; 
+            color: ${confidenceColor};
+            margin: 10px 0;
+        }
+        .section { 
+            margin: 25px 0; 
+            padding: 15px;
+            background: var(--vscode-textCodeBlock-background);
+            border-radius: 5px;
+            border-left: 4px solid var(--vscode-textLink-foreground);
+        }
+        .section h2 { 
+            color: var(--vscode-textLink-foreground);
+            margin-top: 0;
+        }
+        .goal { 
+            font-size: 18px; 
+            font-weight: bold; 
+            color: var(--vscode-textLink-foreground);
+            padding: 10px;
+            background: var(--vscode-editor-background);
+            border-radius: 5px;
+        }
+        .model-info {
+            display: grid;
+            grid-template-columns: 1fr 1fr;
+            gap: 10px;
+            margin: 10px 0;
+        }
+        .info-item {
+            padding: 8px;
+            background: var(--vscode-editor-background);
+            border-radius: 3px;
+        }
+        .param-grid {
+            display: grid;
+            grid-template-columns: repeat(auto-fit, minmax(200px, 1fr));
+            gap: 10px;
+            margin: 10px 0;
+        }
+        .param-item {
+            padding: 10px;
+            background: var(--vscode-editor-background);
+            border-radius: 3px;
+        }
+        .param-label {
+            font-weight: bold;
+            color: var(--vscode-textLink-foreground);
+        }
+        .param-value {
+            font-size: 20px;
+            margin: 5px 0;
+        }
+        .context-item {
+            padding: 10px;
+            margin: 8px 0;
+            background: var(--vscode-editor-background);
+            border-radius: 3px;
+            border-left: 3px solid;
+        }
+        .priority-high { border-color: #F44336; }
+        .priority-medium { border-color: #FF9800; }
+        .priority-low { border-color: #4CAF50; }
+        .missing {
+            background: #F44336;
+            color: white;
+            padding: 5px 10px;
+            border-radius: 3px;
+            display: inline-block;
+            margin: 5px 5px 5px 0;
+        }
+        .filled-prompt {
+            background: var(--vscode-textCodeBlock-background);
+            padding: 15px;
+            border-radius: 5px;
+            white-space: pre-wrap;
+            font-family: var(--vscode-editor-font-family);
+            margin: 10px 0;
+        }
+        .checklist-item {
+            padding: 8px;
+            margin: 5px 0;
+            background: var(--vscode-editor-background);
+            border-radius: 3px;
+        }
+        .checklist-item:before {
+            content: "☐ ";
+            margin-right: 8px;
+        }
+        .btn {
+            padding: 10px 20px;
+            margin: 5px;
+            background: var(--vscode-button-background);
+            color: var(--vscode-button-foreground);
+            border: none;
+            border-radius: 5px;
+            cursor: pointer;
+            font-size: 14px;
+        }
+        .btn:hover {
+            opacity: 0.8;
+        }
+        .btn-primary {
+            background: var(--vscode-textLink-foreground);
+        }
+        .iteration-step {
+            padding: 8px;
+            margin: 5px 0;
+            background: var(--vscode-editor-background);
+            border-radius: 3px;
+            border-left: 3px solid var(--vscode-textLink-foreground);
+        }
+        code {
+            background: var(--vscode-textCodeBlock-background);
+            padding: 2px 6px;
+            border-radius: 3px;
+        }
+        .badge {
+            display: inline-block;
+            padding: 3px 8px;
+            border-radius: 3px;
+            font-size: 12px;
+            margin-left: 8px;
+        }
+        .badge-success { background: #4CAF50; color: white; }
+        .badge-warning { background: #FF9800; color: white; }
+        .badge-info { background: #2196F3; color: white; }
+    </style>
+</head>
+<body>
+    <div class="header">
+        <h1>🤖 ML-Powered Prompt Recommendations</h1>
+        <div class="confidence">Confidence Score: ${rec.confidence}%</div>
+    </div>
+
+    ${chatHistory && chatHistory.recentMessages.length > 0 ? `
+    <div class="section" style="border-left-color: #2196F3;">
+        <h2>💬 Chat History Context</h2>
+        <p><strong>Session:</strong> ${Math.round(chatHistory.sessionDuration / 60000)} minutes</p>
+        <p><strong>Previous messages:</strong> ${chatHistory.recentMessages.length}</p>
+        ${chatHistory.patterns.length > 0 ? `
+        <p><strong>Detected patterns:</strong> ${chatHistory.patterns.join(', ')}</p>
+        ` : ''}
+        ${chatHistory.alreadyMentionedReferences.length > 0 ? `
+        <p><strong>References already mentioned:</strong> ${chatHistory.alreadyMentionedReferences.slice(0, 5).join(', ')}</p>
+        ` : ''}
+        ${chatHistory.alreadyProvidedContext.length > 0 ? `
+        <p><strong>Context already provided:</strong> ${chatHistory.alreadyProvidedContext.slice(0, 5).join(', ')}</p>
+        ` : ''}
+    </div>
+    ` : ''}
+
+    <div class="section">
+        <h2>🎯 Detected Goal</h2>
+        <div class="goal">${rec.goal.replace(/_/g, ' ').replace(/\b\w/g, l => l.toUpperCase())}</div>
+        <p>The ML advisor has identified your prompt's primary goal and optimized recommendations accordingly.</p>
+        ${chatHistory && chatHistory.recentMessages.some((m: any) => m.goal === rec.goal) ? `
+        <p style="color: #2196F3;"><em>💡 This goal matches previous messages in your chat history - recommendations are tailored accordingly.</em></p>
+        ` : ''}
+    </div>
+
+    <div class="section">
+        <h2>🤖 Recommended Model</h2>
+        <div class="model-info">
+            <div class="info-item">
+                <strong>Model:</strong> <code>${rec.suggestedModel.model}</code>
+                ${rec.suggestedModel.isFrontier ? '<span class="badge badge-info">Frontier</span>' : ''}
+            </div>
+            <div class="info-item">
+                <strong>Cost:</strong> ${rec.suggestedModel.costEstimate}
+            </div>
+            <div class="info-item">
+                <strong>Speed:</strong> ${rec.suggestedModel.speedEstimate}
+            </div>
+            <div class="info-item">
+                <strong>Alternatives:</strong> ${rec.suggestedModel.alternatives.join(', ')}
+            </div>
+        </div>
+        <p><strong>Reason:</strong> ${rec.suggestedModel.reason}</p>
+        <button class="btn" onclick="copySettings()">Copy Model Settings</button>
+    </div>
+
+    ${rec.cursorAutoModelSufficient ? `
+    <div class="section" style="border-left-color: #4CAF50;">
+        <h2>✅ Cursor Auto Model</h2>
+        <p><strong>Status:</strong> <span style="color: #4CAF50;">Sufficient ✓</span></p>
+        <p>${rec.cursorAutoModelReason}</p>
+        <p><em>You can use Cursor's auto model selection - it will choose an appropriate model automatically.</em></p>
+    </div>
+    ` : rec.frontierModelRecommendation ? `
+    <div class="section" style="border-left-color: #FF9800;">
+        <h2>🚀 Frontier Model Recommendation</h2>
+        <p><strong>Status:</strong> <span style="color: #FF9800;">Frontier Model Recommended</span></p>
+        <p>${rec.cursorAutoModelReason}</p>
+        <div style="margin-top: 15px; padding: 10px; background: var(--vscode-editor-background); border-radius: 5px;">
+            <p><strong>Recommended:</strong> <code>${rec.frontierModelRecommendation.recommended}</code></p>
+            <p><strong>Reason:</strong> ${rec.frontierModelRecommendation.reason}</p>
+            <p><strong>Alternatives:</strong> ${rec.frontierModelRecommendation.alternatives.join(', ')}</p>
+            <p><strong>When to Use:</strong> ${rec.frontierModelRecommendation.whenToUse}</p>
+        </div>
+    </div>
+    ` : ''}
+
+    <div class="section" style="border-left-color: ${rec.gemini3FreeCompatible.compatible ? '#4CAF50' : '#FF9800'};">
+        <h2>🆓 Google Gemini 3 Free Mode</h2>
+        <p><strong>Compatible:</strong> <span style="color: ${rec.gemini3FreeCompatible.compatible ? '#4CAF50' : '#FF9800'};">${rec.gemini3FreeCompatible.compatible ? 'Yes ✓' : 'Not Recommended'}</span></p>
+        <p>${rec.gemini3FreeCompatible.reason}</p>
+        <p><strong>Estimated Tokens:</strong> ${rec.gemini3FreeCompatible.estimatedTokens.toLocaleString()} / 100,000 limit</p>
+        ${rec.gemini3FreeCompatible.limitations.length > 0 && rec.gemini3FreeCompatible.limitations[0] !== 'None' ? `
+        <div style="margin-top: 10px;">
+            <strong>Limitations:</strong>
+            <ul>
+                ${rec.gemini3FreeCompatible.limitations.map(l => `<li>${l}</li>`).join('')}
+            </ul>
+        </div>
+        ` : ''}
+        <div style="margin-top: 10px;">
+            <strong>Recommendations:</strong>
+            <ul>
+                ${rec.gemini3FreeCompatible.recommendations.map(r => `<li>${r}</li>`).join('')}
+            </ul>
+        </div>
+    </div>
+
+    ${rec.suggestedLanguages.length > 0 ? `
+    <div class="section">
+        <h2>💻 Suggested Programming Languages</h2>
+        ${rec.suggestedLanguages.map(lang => `
+            <div style="margin: 15px 0; padding: 15px; background: var(--vscode-editor-background); border-radius: 5px; border-left: 4px solid var(--vscode-textLink-foreground);">
+                <h3 style="margin-top: 0;">
+                    ${lang.language} 
+                    <span class="badge badge-${lang.complexity === 'simple' ? 'success' : lang.complexity === 'medium' ? 'warning' : 'info'}">${lang.complexity}</span>
+                    <span class="badge badge-info">${lang.suitability}% match</span>
+                </h3>
+                <p><strong>Reason:</strong> ${lang.reason}</p>
+                ${lang.pros.length > 0 ? `
+                <p><strong>Pros:</strong> ${lang.pros.join(', ')}</p>
+                ` : ''}
+                ${lang.cons.length > 0 ? `
+                <p><strong>Cons:</strong> ${lang.cons.join(', ')}</p>
+                ` : ''}
+            </div>
+        `).join('')}
+    </div>
+    ` : ''}
+
+    ${chatHistory?.attachedReferences && chatHistory.attachedReferences.length > 0 ? `
+    <div class="section">
+        <h2>📎 Attached References from Chat</h2>
+        <p>The following references are currently available to ground the prompt:</p>
+        ${chatHistory.attachedReferences.slice(-5).map((ref: any) => `
+            <div class="context-item">
+                <strong>${escapeHtml(ref.name)}</strong>
+                <p>${escapeHtml(ref.summary)}</p>
+                ${ref.source ? `<small>Source: ${escapeHtml(ref.source)}</small>` : ''}
+            </div>
+        `).join('')}
+    </div>
+    ` : ''}
+
+    ${rec.requiredReferences.length > 0 ? `
+    <div class="section" style="border-left-color: ${rec.referenceAssessment.referencesImpactDecision ? '#F44336' : '#FF9800'};">
+        <h2>📚 Required References</h2>
+        ${rec.referenceAssessment.referencesImpactDecision ? `
+        <div style="padding: 15px; background: #F44336; color: white; border-radius: 5px; margin-bottom: 15px;">
+            <strong>⚠️ CRITICAL FOR DECISION-MAKING</strong>
+            <p style="margin: 5px 0;">${rec.referenceAssessment.recommendation}</p>
+            <p style="margin: 5px 0;"><strong>Confidence without refs:</strong> ${rec.referenceAssessment.decisionConfidenceWithoutRefs}%</p>
+            <p style="margin: 5px 0;"><strong>Confidence with refs:</strong> ${rec.referenceAssessment.decisionConfidenceWithRefs}%</p>
+        </div>
+        ` : `
+        <p><strong>Status:</strong> References are helpful but not critical</p>
+        `}
+        <p>The ML advisor recommends having these references available:</p>
+        ${rec.requiredReferences.map(ref => `
+            <div class="context-item priority-${ref.priority}" style="${ref.criticalForDecision ? 'border-left-width: 5px; border-left-color: #F44336;' : ''}">
+                <strong>${ref.type.replace(/_/g, ' ').toUpperCase()}</strong> 
+                <span class="badge badge-${ref.priority === 'high' ? 'warning' : ref.priority === 'medium' ? 'info' : 'success'}">${ref.priority}</span>
+                ${ref.criticalForDecision ? '<span class="badge" style="background: #F44336; color: white;">CRITICAL</span>' : ''}
+                <p>${ref.description}</p>
+                ${ref.criticalForDecision ? `<p style="color: #F44336; font-weight: bold;">⚠️ ${ref.whyNeeded}</p>` : ''}
+                <p><strong>Examples:</strong> ${ref.examples.join(', ')}</p>
+                <small><strong>Where to find:</strong> ${ref.whereToFind}</small>
+            </div>
+        `).join('')}
+        ${rec.referenceAssessment.processStepsRequiringRefs.length > 0 ? `
+        <div style="margin-top: 15px; padding: 10px; background: var(--vscode-editor-background); border-radius: 5px;">
+            <strong>Decision steps requiring references:</strong>
+            <ul>
+                ${rec.referenceAssessment.processStepsRequiringRefs.map(step => `<li>${step}</li>`).join('')}
+            </ul>
+        </div>
+        ` : ''}
+    </div>
+    ` : ''}
+
+    <div class="section">
+        <h2>🌡️ Recommended Parameters</h2>
+        <div class="param-grid">
+            <div class="param-item">
+                <div class="param-label">Temperature</div>
+                <div class="param-value">${rec.temperature}</div>
+                <small>${rec.temperature < 0.3 ? 'Deterministic (good for code/facts)' : rec.temperature > 0.7 ? 'Creative (good for brainstorming)' : 'Balanced'}</small>
+            </div>
+            ${rec.samplingParams.topP ? `
+            <div class="param-item">
+                <div class="param-label">Top-P</div>
+                <div class="param-value">${rec.samplingParams.topP}</div>
+            </div>
+            ` : ''}
+            ${rec.samplingParams.topK ? `
+            <div class="param-item">
+                <div class="param-label">Top-K</div>
+                <div class="param-value">${rec.samplingParams.topK}</div>
+            </div>
+            ` : ''}
+            ${rec.samplingParams.frequencyPenalty ? `
+            <div class="param-item">
+                <div class="param-label">Frequency Penalty</div>
+                <div class="param-value">${rec.samplingParams.frequencyPenalty}</div>
+            </div>
+            ` : ''}
+        </div>
+        <button class="btn" onclick="copySettings()">Copy Parameter Settings</button>
+    </div>
+
+    <div class="section">
+        <h2>📋 Required Context</h2>
+        <p>The ML advisor recommends providing the following context for best results:</p>
+        ${rec.requiredContext.map(ctx => `
+            <div class="context-item priority-${ctx.priority}">
+                <strong>${ctx.type.replace(/_/g, ' ').toUpperCase()}</strong> 
+                <span class="badge badge-${ctx.priority === 'high' ? 'warning' : ctx.priority === 'medium' ? 'info' : 'success'}">${ctx.priority}</span>
+                <p>${ctx.description}</p>
+                <small><strong>Example:</strong> ${ctx.example}</small>
+            </div>
+        `).join('')}
+        ${rec.requiredContext.length === 0 ? '<p>✅ Your prompt has sufficient context!</p>' : ''}
+    </div>
+
+    <div class="section">
+        <h2>📝 Recommended Format</h2>
+        <p><strong>Format:</strong> <code>${rec.suggestedFormat.format}</code></p>
+        <p><strong>Structure:</strong> ${rec.suggestedFormat.structure}</p>
+        <p><strong>Reason:</strong> ${rec.suggestedFormat.reason}</p>
+        <details>
+            <summary>Example Format</summary>
+            <pre style="background: var(--vscode-textCodeBlock-background); padding: 10px; border-radius: 5px; margin-top: 10px;">${escapeHtml(rec.suggestedFormat.example)}</pre>
+        </details>
+    </div>
+
+    ${rec.missingElements.length > 0 ? `
+    <div class="section">
+        <h2>⚠️ Missing Elements & Recommendations</h2>
+        <p>The ML advisor identified these missing elements and recommends:</p>
+        ${rec.missingElements.map(elem => {
+            const isDetailRec = elem.toLowerCase().includes('detail') || elem.toLowerCase().includes('break');
+            const isBreakdownRec = elem.toLowerCase().includes('step') || elem.toLowerCase().includes('break');
+            return `<div class="missing" style="${isDetailRec || isBreakdownRec ? 'background: #2196F3; font-weight: bold;' : ''}">${escapeHtml(elem)}</div>`;
+        }).join('')}
+        <div style="margin-top: 15px; padding: 15px; background: var(--vscode-editor-background); border-radius: 5px; border-left: 4px solid #2196F3;">
+            <h3 style="margin-top: 0; color: #2196F3;">💡 Key Recommendations:</h3>
+            <ul>
+                <li><strong>Break it down:</strong> Divide complex tasks into numbered steps (1, 2, 3...)</li>
+                <li><strong>Add detail:</strong> Specify what exactly, where, how, and why for each step</li>
+                <li><strong>Be specific:</strong> Use exact names, numbers, and concrete examples</li>
+                <li><strong>Make it actionable:</strong> Each step should be independently verifiable</li>
+            </ul>
+        </div>
+    </div>
+    ` : ''}
+
+    <div class="section">
+        <h2>✨ Enhanced Prompt (Agentic)</h2>
+        ${rec.agenticPrompt ? `
+        <div style="background: #4CAF50; color: white; padding: 10px; border-radius: 5px; margin-bottom: 15px;">
+            <strong>🤖 Agentic Planning Enabled</strong>
+            <p style="margin: 5px 0 0 0; font-size: 0.9em;">Goal decomposition, step planning, and automatic optimization applied</p>
+        </div>
+        <div style="margin-bottom: 15px;">
+            <h3>Agentic Plan Summary:</h3>
+            <p><strong>Overall Goal:</strong> ${escapeHtml(rec.agenticPrompt.plan.overallGoal.replace(/_/g, ' '))}</p>
+            <p><strong>Complexity:</strong> <span class="badge badge-${rec.agenticPrompt.plan.estimatedComplexity === 'simple' ? 'success' : rec.agenticPrompt.plan.estimatedComplexity === 'medium' ? 'info' : 'warning'}">${rec.agenticPrompt.plan.estimatedComplexity.toUpperCase()}</span></p>
+            <p><strong>Confidence:</strong> ${rec.agenticPrompt.plan.confidence}%</p>
+            <p><strong>Steps with Goals:</strong> ${rec.agenticPrompt.plan.stepGoals.length}</p>
+        </div>
+        <details style="margin-bottom: 15px;">
+            <summary style="cursor: pointer; font-weight: bold; color: #2196F3;">📋 View Step Goals & Plan</summary>
+            <div style="margin-top: 10px; padding: 10px; background: var(--vscode-editor-background); border-radius: 5px;">
+                ${rec.agenticPrompt.plan.stepGoals.map(step => {
+                    // Get AI-determined success criteria if available
+                    const aiCriteria = rec.agenticPrompt?.aiDeterminedSuccessCriteria?.get(step.stepNumber) || step.successCriteria;
+                    return `
+                <div style="margin-bottom: 15px; padding: 10px; border-left: 3px solid #2196F3;">
+                    <strong>Step ${step.stepNumber}: ${escapeHtml(step.goal)}</strong>
+                    <p style="margin: 5px 0; color: #666; font-size: 0.9em;">${escapeHtml(step.rationale)}</p>
+                    <div style="margin-top: 8px;">
+                        <strong>Sub-goals:</strong>
+                        <ul style="margin: 5px 0; padding-left: 20px;">
+                            ${step.subGoals.map(sg => `<li>${escapeHtml(sg)}</li>`).join('')}
+                        </ul>
+                    </div>
+                    <div style="margin-top: 8px;">
+                        <strong>Success Criteria (AI-Determined):</strong>
+                        <div style="background: #E8F5E9; padding: 8px; border-radius: 4px; margin-top: 5px;">
+                            <ul style="margin: 5px 0; padding-left: 20px;">
+                                ${aiCriteria.map(sc => `<li>✓ ${escapeHtml(sc)}</li>`).join('')}
+                            </ul>
+                        </div>
+                    </div>
+                </div>
+                `;
+                }).join('')}
+            </div>
+        </details>
+        ${rec.agenticPrompt?.structuralDecisions ? `
+        <details style="margin-bottom: 15px;">
+            <summary style="cursor: pointer; font-weight: bold; color: #FF9800;">🏗️ View Structural Decisions</summary>
+            <div style="margin-top: 10px; padding: 10px; background: var(--vscode-editor-background); border-radius: 5px;">
+                <p><strong>Framework:</strong> ${escapeHtml(rec.agenticPrompt.structuralDecisions.recommendedStructure)}</p>
+                <p><strong>Format Style:</strong> ${escapeHtml(rec.agenticPrompt.structuralDecisions.formatStyle)}</p>
+                <p><strong>Rationale:</strong> ${escapeHtml(rec.agenticPrompt.structuralDecisions.rationale)}</p>
+                <div style="margin-top: 10px;">
+                    <strong>Sections:</strong>
+                    <ul style="margin: 5px 0; padding-left: 20px;">
+                        ${rec.agenticPrompt.structuralDecisions.sections.map(s => `<li>${escapeHtml(s)}</li>`).join('')}
+                    </ul>
+                </div>
+            </div>
+        </details>
+        ` : ''}
+        <details style="margin-bottom: 15px;">
+            <summary style="cursor: pointer; font-weight: bold; color: #2196F3;">🧠 View Reasoning</summary>
+            <div style="margin-top: 10px; padding: 10px; background: var(--vscode-editor-background); border-radius: 5px; white-space: pre-wrap; font-size: 0.9em;">
+                ${escapeHtml(rec.agenticPrompt.reasoning)}
+            </div>
+        </details>
+        ` : ''}
+        ${rec.agenticPrompt?.mlGenerated ? `
+        <div style="background: #2196F3; color: white; padding: 15px; border-radius: 5px; margin-bottom: 15px;">
+            <h3 style="margin-top: 0;">🤖 ML-Generated Ideal Prompt</h3>
+            <p style="margin: 5px 0;">Generated using learned patterns to follow all prompt engineering rules</p>
+            <p style="margin: 5px 0;"><strong>Confidence:</strong> ${rec.agenticPrompt.mlGenerated.confidence}%</p>
+            <p style="margin: 5px 0;"><strong>Rules Followed:</strong> ${rec.agenticPrompt.mlGenerated.rulesFollowed.length}</p>
+            <p style="margin: 5px 0;"><strong>Patterns Applied:</strong> ${rec.agenticPrompt.mlGenerated.patternsApplied.length}</p>
+        </div>
+        <details style="margin-bottom: 15px;">
+            <summary style="cursor: pointer; font-weight: bold; color: #2196F3;">🔍 View ML Patterns Applied</summary>
+            <div style="margin-top: 10px; padding: 10px; background: var(--vscode-editor-background); border-radius: 5px;">
+                ${rec.agenticPrompt.mlGenerated.patternsApplied.map(pattern => `
+                    <div style="margin-bottom: 10px; padding: 10px; border-left: 3px solid #2196F3;">
+                        <strong>${escapeHtml(pattern.pattern)}</strong>
+                        <p style="margin: 5px 0; color: #666; font-size: 0.9em;">Context: ${escapeHtml(pattern.context)}</p>
+                        <p style="margin: 5px 0; color: #666; font-size: 0.9em;">Application: ${escapeHtml(pattern.application)}</p>
+                        <p style="margin: 5px 0; color: #666; font-size: 0.9em;">Confidence: ${(pattern.confidence * 100).toFixed(0)}%</p>
+                    </div>
+                `).join('')}
+            </div>
+        </details>
+        <details style="margin-bottom: 15px;">
+            <summary style="cursor: pointer; font-weight: bold; color: #4CAF50;">✓ Rules Followed</summary>
+            <div style="margin-top: 10px; padding: 10px; background: var(--vscode-editor-background); border-radius: 5px;">
+                <ul style="margin: 5px 0; padding-left: 20px;">
+                    ${rec.agenticPrompt.mlGenerated.rulesFollowed.map(rule => `<li>✓ ${escapeHtml(rule)}</li>`).join('')}
+                </ul>
+            </div>
+        </details>
+        <p style="font-weight: bold; color: #4CAF50; margin-bottom: 10px;">✨ Ideal Prompt (ML-Generated Following Rules):</p>
+        <div class="filled-prompt" style="white-space: pre-wrap; font-family: monospace; background: var(--vscode-textCodeBlock-background); padding: 15px; border-radius: 5px; border: 2px solid #4CAF50;">${escapeHtml(rec.agenticPrompt.mlGenerated.prompt)}</div>
+        ` : `
+        <p>The agentic system has intelligently filled in details and generated an optimized prompt:</p>
+        <div class="filled-prompt" style="white-space: pre-wrap; font-family: monospace; background: var(--vscode-textCodeBlock-background); padding: 15px; border-radius: 5px; border: 1px solid var(--vscode-panel-border);">${escapeHtml(rec.filledPrompt)}</div>
+        `}
+        <button class="btn btn-primary" onclick="copyPrompt()" style="margin-top: 10px;">📋 Copy Ideal Prompt</button>
+        ${rec.agenticPrompt && (rec.agenticPrompt.improvements.some(imp => imp.includes('filled in')) || rec.missingElements.length > 0) ? `
+        <div style="margin-top: 15px; padding: 10px; background: #FFF9C4; border-radius: 5px; border-left: 4px solid #FBC02D;">
+            <strong>💡 Note:</strong> The agentic system has made intelligent inferences to fill in details. If you need to adjust any part of the prompt, you can edit it after copying.
+            ${rec.missingElements.length > 0 ? `
+            <div style="margin-top: 10px;">
+                <strong>Additional details you may want to specify:</strong>
+                <ul style="margin: 5px 0; padding-left: 20px;">
+                    ${rec.missingElements.slice(0, 3).map(elm => `<li>${escapeHtml(elm)}</li>`).join('')}
+                </ul>
+            </div>
+            ` : ''}
+        </div>
+        ` : ''}
+        ${rec.agenticPrompt && rec.agenticPrompt.improvements.length > 0 ? `
+        <div style="margin-top: 15px; padding: 10px; background: #E3F2FD; border-radius: 5px;">
+            <strong>Key Improvements Made:</strong>
+            <ul style="margin: 5px 0; padding-left: 20px;">
+                ${rec.agenticPrompt.improvements.map(imp => `<li>${escapeHtml(imp)}</li>`).join('')}
+            </ul>
+        </div>
+        ` : ''}
+        ${rec.agenticPrompt && rec.agenticPrompt.structuralChanges && rec.agenticPrompt.structuralChanges.length > 0 ? `
+        <div style="margin-top: 15px; padding: 10px; background: #FFF3E0; border-radius: 5px;">
+            <strong>Structural Changes Applied:</strong>
+            <ul style="margin: 5px 0; padding-left: 20px;">
+                ${rec.agenticPrompt.structuralChanges.map(change => `<li>${escapeHtml(change)}</li>`).join('')}
+            </ul>
+        </div>
+        ` : ''}
+    </div>
+
+    <div class="section">
+        <h2>🎯 Concrete Task Action Plan</h2>
+        ${rec.taskActionPlan.basedOnHistory ? `
+        <div style="background: #4CAF50; color: white; padding: 8px; border-radius: 4px; margin-bottom: 15px;">
+            📊 ${escapeHtml(rec.taskActionPlan.historyPattern || 'Based on chat history patterns')}
+        </div>
+        ` : ''}
+        <p><strong>Complexity:</strong> <span class="badge badge-${rec.taskActionPlan.complexity === 'simple' ? 'success' : rec.taskActionPlan.complexity === 'medium' ? 'info' : 'warning'}">${rec.taskActionPlan.complexity.toUpperCase()}</span></p>
+        ${rec.taskActionPlan.totalEstimatedTime ? `<p><strong>Estimated Time:</strong> ${escapeHtml(rec.taskActionPlan.totalEstimatedTime)}</p>` : ''}
+        
+        ${rec.taskActionPlan.prerequisites.length > 0 ? `
+        <div style="margin-bottom: 15px;">
+            <strong>Prerequisites:</strong>
+            <ul>
+                ${rec.taskActionPlan.prerequisites.map(prereq => `<li>${escapeHtml(prereq)}</li>`).join('')}
+            </ul>
+        </div>
+        ` : ''}
+        
+        <h3>Action Steps:</h3>
+        <ol style="list-style: none; padding-left: 0;">
+            ${rec.taskActionPlan.steps.map(step => `
+            <li style="margin-bottom: 20px; padding: 15px; background: var(--vscode-editor-background); border-radius: 5px; border-left: 4px solid #2196F3;">
+                <div style="font-weight: bold; color: #2196F3; margin-bottom: 5px;">
+                    Step ${step.stepNumber}: ${escapeHtml(step.action)}
+                </div>
+                <div style="margin-bottom: 8px; color: var(--vscode-foreground);">
+                    ${escapeHtml(step.description)}
+                </div>
+                <div style="font-size: 0.9em; color: #666; margin-bottom: 5px;">
+                    <strong>Why:</strong> ${escapeHtml(step.why)}
+                </div>
+                ${step.estimatedTime ? `<div style="font-size: 0.9em; color: #666; margin-bottom: 5px;"><strong>Time:</strong> ${escapeHtml(step.estimatedTime)}</div>` : ''}
+                ${step.dependencies && step.dependencies.length > 0 ? `
+                <div style="font-size: 0.9em; color: #FF9800; margin-bottom: 5px;">
+                    <strong>Dependencies:</strong> ${step.dependencies.map(d => escapeHtml(d)).join(', ')}
+                </div>
+                ` : ''}
+                ${step.requiredContext && step.requiredContext.length > 0 ? `
+                <div style="font-size: 0.9em; color: #9C27B0; margin-bottom: 5px;">
+                    <strong>Required Context:</strong> ${step.requiredContext.map(c => escapeHtml(c)).join(', ')}
+                </div>
+                ` : ''}
+            </li>
+            `).join('')}
+        </ol>
+    </div>
+
+    <div class="section">
+        <h2>🔄 Iteration Strategy (Prompt Refinement)</h2>
+        <p><strong>Expected Iterations:</strong> ${rec.iterationStrategy.expectedIterations}</p>
+        <h3>Steps:</h3>
+        ${rec.iterationStrategy.steps.map((step, i) => `
+            <div class="iteration-step">${step}</div>
+        `).join('')}
+        ${rec.iterationStrategy.refinementPoints.length > 0 ? `
+        <h3>Refinement Points:</h3>
+        <ul>
+            ${rec.iterationStrategy.refinementPoints.map(point => `<li>${point}</li>`).join('')}
+        </ul>
+        ` : ''}
+    </div>
+
+    <div class="section">
+        <h2>✅ Verification Checklist</h2>
+        <p>Use this checklist to verify the AI's response:</p>
+        ${rec.verificationChecklist.map(item => `
+            <div class="checklist-item">${escapeHtml(item)}</div>
+        `).join('')}
+    </div>
+
+    <script>
+        const vscode = acquireVsCodeApi();
+        
+        function copyPrompt() {
+            // Use ML-generated ideal prompt if available, otherwise use filled prompt
+            const prompt = \`${escapeHtml(rec.agenticPrompt?.mlGenerated?.prompt || rec.filledPrompt)}\`;
+            vscode.postMessage({
+                command: 'copyPrompt',
+                text: prompt
+            });
+        }
+        
+        function copySettings() {
+            const settings = \`Model: ${rec.suggestedModel.model}
+Temperature: ${rec.temperature}
+${rec.samplingParams.topP ? `Top-P: ${rec.samplingParams.topP}` : ''}
+${rec.samplingParams.topK ? `Top-K: ${rec.samplingParams.topK}` : ''}
+${rec.samplingParams.frequencyPenalty ? `Frequency Penalty: ${rec.samplingParams.frequencyPenalty}` : ''}
+Format: ${rec.suggestedFormat.format}\`;
+            vscode.postMessage({
+                command: 'copySettings',
+                text: settings
+            });
+        }
+    </script>
+</body>
+</html>`;
+}
+
+function escapeHtml(text: string): string {
+    return text
+        .replace(/&/g, '&amp;')
+        .replace(/</g, '&lt;')
+        .replace(/>/g, '&gt;')
+        .replace(/"/g, '&quot;')
+        .replace(/'/g, '&#039;')
+        .replace(/\n/g, '<br>');
+}
+
+function setupAutoSuggest(context: vscode.ExtensionContext, analyzer: PromptAnalyzer, templates: PromptTemplates) {
+    // This would implement auto-suggestions as you type
+    // For now, it's a placeholder for future enhancement
+}
+
+export function deactivate() {}
+
