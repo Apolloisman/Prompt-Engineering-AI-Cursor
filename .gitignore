@@ -1,0 +1,68 @@
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+.Python
+env/
+venv/
+ENV/
+.venv
+
+# PyTorch model checkpoints (too large for GitHub)
+*.pt
+*.pth
+*.ckpt
+checkpoints/
+models/
+*.bin
+*.safetensors
+
+# Node.js
+node_modules/
+npm-debug.log*
+yarn-debug.log*
+yarn-error.log*
+package-lock.json
+
+# Model caches
+.cache/
+*.cache
+transformers_cache/
+huggingface_cache/
+
+# IDE
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
+
+# OS
+.DS_Store
+Thumbs.db
+desktop.ini
+
+# Data files (if large)
+*.csv
+*.json
+data/*.json
+!data/sample_*.json
+
+# Logs
+*.log
+logs/
+
+# Environment variables
+.env
+.env.local
+
+# Jupyter
+.ipynb_checkpoints/
+*.ipynb
+
+# Training outputs
+outputs/
+runs/
+wandb/
+

@@ -1,0 +1,365 @@
+PROMPT ENGINEERING GUIDE
+========================
+
+This guide contains best practices, frameworks, and tips for creating effective prompts.
+Use this as a reference when crafting prompts for AI assistants.
+
+CORE PRINCIPLES
+---------------
+
+1. BE SPECIFIC AND CLEAR
+   - Clearly state what you want
+   - Avoid ambiguity
+   - Use precise language
+   - Define technical terms if needed
+
+2. KEEP IT CONCRETE, NOT CONTINUOUS
+   - Use discrete, actionable steps rather than abstract flows
+   - Break tasks into specific, measurable chunks
+   - Avoid vague, continuous descriptions
+   - Prefer "do X, then Y, then Z" over "work on this generally"
+   - Make each step independently verifiable
+   - Use concrete examples and specific outputs
+   
+   Example (Continuous/Bad):
+   "Improve the code quality and make it better"
+   
+   Example (Concrete/Good):
+   "1. Add type hints to all function parameters
+    2. Extract magic numbers into named constants
+    3. Add docstrings following Google style
+    4. Split the 200-line function into 3 smaller functions"
+
+3. PROVIDE CONTEXT
+   - Include relevant background information
+   - Explain the problem domain
+   - Mention constraints or requirements
+   - Share relevant examples or patterns
+
+4. STRUCTURE YOUR PROMPT
+   - Use clear sections (Task, Context, Requirements, Output Format)
+   - Break complex requests into discrete steps
+   - Use formatting (bullets, numbered lists, code blocks)
+   - Make each section independently actionable
+
+5. INCLUDE EXAMPLES
+   - Show what good output looks like
+   - Provide sample inputs/outputs
+   - Demonstrate edge cases
+   - Use concrete, specific examples
+
+6. ITERATE AND REFINE
+   - Start broad, then narrow down
+   - Test different phrasings
+   - Learn from what works
+
+PROMPT STRUCTURE FRAMEWORKS
+---------------------------
+
+FRAMEWORK 1: Role-Context-Task-Format (RCTF)
+---------------------------------------------
+[Role] You are a [specific role/expertise]
+[Context] Working on [project/domain] where [background info]
+[Task] [Specific action to perform]
+[Format] Output should be [format requirements]
+
+Example:
+"You are a senior Python developer working on a web scraping project 
+that needs to handle rate limiting. Create a function that implements 
+exponential backoff. Output should be production-ready code with docstrings."
+
+FRAMEWORK 2: Situation-Task-Action-Result (STAR)
+-------------------------------------------------
+[Situation] Describe the current state
+[Task] What needs to be accomplished
+[Action] Specific steps or approach
+[Result] Expected outcome or format
+
+FRAMEWORK 3: Chain-of-Thought
+-----------------------------
+Break complex problems into steps:
+1. First, analyze...
+2. Then, identify...
+3. Next, create...
+4. Finally, verify...
+
+COMMON PROMPT PATTERNS
+----------------------
+
+PATTERN 1: Code Generation
+---------------------------
+- Specify language and version
+- Include requirements/constraints
+- Mention style preferences
+- Request error handling
+- Ask for comments/docstrings
+
+Example:
+"Write a Python 3.10 function that:
+- Takes a list of dictionaries
+- Filters items where 'status' == 'active'
+- Returns sorted by 'priority' (descending)
+- Includes type hints and error handling
+- Add docstring with examples"
+
+PATTERN 2: Code Review/Refactoring
+-----------------------------------
+- Point to specific code sections
+- Mention concerns (performance, readability, security)
+- Request specific improvements
+- Ask for explanations
+
+Example:
+"Review this function for performance issues. Focus on:
+- Time complexity
+- Memory usage
+- Potential bottlenecks
+Suggest optimizations with explanations."
+
+PATTERN 3: Problem Solving
+--------------------------
+- Describe the problem clearly
+- Include constraints
+- Specify success criteria
+- Request multiple approaches if needed
+
+PATTERN 4: Explanation/Teaching
+-------------------------------
+- Specify audience level
+- Request analogies or examples
+- Ask for step-by-step breakdown
+- Include common pitfalls
+
+Example:
+"Explain [concept] to a beginner. Use:
+- Simple analogies
+- Step-by-step breakdown
+- Code examples
+- Common mistakes to avoid"
+
+PATTERN 5: Debugging
+--------------------
+- Include error messages
+- Show relevant code
+- Describe expected vs actual behavior
+- Mention environment details
+
+BEST PRACTICES
+--------------
+
+DO:
+✓ Be specific about what you want
+✓ Keep prompts concrete and discrete (not abstract/continuous)
+✓ Break tasks into independently actionable steps
+✓ Provide relevant context and background
+✓ Use examples to illustrate your needs
+✓ Break complex tasks into smaller parts
+✓ Specify output format (code, markdown, JSON, etc.)
+✓ Mention constraints (time, space, style)
+✓ Ask for explanations when needed
+✓ Request alternatives or trade-offs
+✓ Include edge cases to consider
+✓ Make each requirement independently verifiable
+
+DON'T:
+✗ Be vague or ambiguous
+✗ Use abstract, continuous descriptions ("improve things generally")
+✗ Assume the AI knows your project context
+✗ Ask for everything at once (break it down)
+✗ Forget to specify format requirements
+✗ Skip important constraints
+✗ Use jargon without explanation
+✗ Ask for impossible or contradictory things
+✗ Use flowing, theoretical language when concrete steps are needed
+
+ADVANCED TECHNIQUES
+-------------------
+
+1. FEW-SHOT LEARNING
+   Provide 2-3 examples of input/output pairs:
+   "Here are examples:
+   Input: [example 1]
+   Output: [example 1]
+   
+   Input: [example 2]
+   Output: [example 2]
+   
+   Now process: [your input]"
+
+2. STEP-BY-STEP REASONING
+   Ask the AI to show its thinking:
+   "Think step by step. First explain your approach, 
+   then provide the solution."
+
+3. CONSTRAINTS AND REQUIREMENTS
+   Be explicit about limitations:
+   - "Must work with Python 3.8+"
+   - "No external dependencies"
+   - "Must be under 50 lines"
+   - "Follow PEP 8 style guide"
+
+4. ITERATIVE REFINEMENT
+   Start broad, then narrow:
+   Round 1: "Create a function to process data"
+   Round 2: "Add error handling and logging"
+   Round 3: "Optimize for performance"
+
+5. ROLE PLAYING
+   Assign a specific role:
+   "You are a security expert reviewing this code..."
+   "Act as a code reviewer with 10 years experience..."
+
+6. OUTPUT FORMATTING
+   Specify exact format:
+   - "Return JSON with keys: name, age, email"
+   - "Use markdown with headers"
+   - "Provide as a table"
+   - "Include code comments"
+
+PROMPT TEMPLATES
+----------------
+
+TEMPLATE 1: Code Generation
+----------------------------
+[Role]: You are a [language] developer
+[Context]: Working on [project/feature]
+[Task]: Create [what] that [does what]
+[Requirements]:
+- [requirement 1]
+- [requirement 2]
+- [requirement 3]
+[Format]: [code/markdown/JSON/etc]
+[Style]: [coding standards]
+
+TEMPLATE 2: Code Review
+-----------------------
+Review the following [language] code:
+[code block]
+
+Focus on:
+- [aspect 1]
+- [aspect 2]
+- [aspect 3]
+
+Provide:
+- Issues found
+- Suggestions for improvement
+- Refactored code (if applicable)
+
+TEMPLATE 3: Problem Solving
+----------------------------
+Problem: [describe problem]
+Context: [background information]
+Constraints: [limitations]
+Expected Output: [what success looks like]
+
+Please:
+1. Analyze the problem
+2. Propose solution(s)
+3. Explain trade-offs
+4. Provide implementation
+
+TEMPLATE 4: Learning/Explanation
+---------------------------------
+Explain [concept/topic] to someone with [knowledge level].
+
+Include:
+- Core concepts
+- How it works
+- Practical examples
+- Common use cases
+- Potential pitfalls
+
+TEMPLATE 5: Debugging
+----------------------
+I'm experiencing an issue:
+- Expected: [what should happen]
+- Actual: [what actually happens]
+- Error: [error message if any]
+- Code: [relevant code]
+- Environment: [relevant details]
+
+Please help identify the problem and suggest fixes.
+
+COMMON PROMPT IMPROVEMENTS
+--------------------------
+
+WEAK PROMPT:
+"Fix my code"
+
+STRONG PROMPT:
+"I have a Python function that's throwing a TypeError. 
+The function processes user input and should return a 
+dictionary. Here's the code: [code]. The error occurs 
+when [specific scenario]. Please identify the issue, 
+explain why it happens, and provide a fix with 
+error handling."
+
+WEAK PROMPT:
+"Make it faster"
+
+STRONG PROMPT:
+"Optimize this function for performance. Current 
+execution time is ~500ms for 10,000 items. Target 
+is <100ms. Focus on algorithmic improvements. 
+The function: [code]. Maintain the same output format."
+
+WEAK PROMPT:
+"Explain this"
+
+STRONG PROMPT:
+"Explain how this React hook works to someone new 
+to React hooks. Break down: [code]. Include:
+- What each part does
+- Why it's structured this way
+- How to use it
+- Common mistakes"
+
+WEAK PROMPT (Continuous/Abstract):
+"Refactor this codebase to be cleaner and more maintainable"
+
+STRONG PROMPT (Concrete/Discrete):
+"Refactor this codebase with these specific steps:
+1. Extract all hardcoded strings into a constants file
+2. Split the 500-line service class into 5 focused classes
+3. Add unit tests for the 3 core business logic functions
+4. Replace all 'any' types with proper TypeScript interfaces
+5. Add error handling to all async operations
+Start with step 1 and show the changes."
+
+PROMPT CHECKLIST
+----------------
+
+Before sending your prompt, check:
+□ Is my request clear and specific?
+□ Is it concrete/discrete rather than abstract/continuous?
+□ Can each step be independently verified?
+□ Have I provided enough context?
+□ Are my requirements explicit?
+□ Have I specified the output format?
+□ Did I include relevant examples?
+□ Are constraints clearly stated?
+□ Is the task broken into manageable parts?
+□ Have I mentioned any style preferences?
+□ Did I include error cases or edge cases?
+
+WORKING WITH THIS GUIDE
+-----------------------
+
+When crafting prompts:
+1. Review relevant sections above
+2. Choose an appropriate framework
+3. Use a template as a starting point
+4. Customize for your specific needs
+5. Include all relevant context
+6. Specify output format
+7. Iterate based on results
+
+You can reference this guide when working with AI assistants:
+- "Using the RCTF framework, help me..."
+- "Following the code generation pattern, create..."
+- "Based on the best practices, review..."
+
+Remember: Good prompts are iterative. Start with a draft, 
+test it, and refine based on the results.
+
